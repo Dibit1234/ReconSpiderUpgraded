@@ -57,7 +57,7 @@ class WebReconSpider(scrapy.Spider):
 
     USERNAME_CONTEXT_RE = re.compile(
         r"(?ix)"
-        r"(?:username|user|login|account|userid|user_id)"
+        r"(?<![a-z0-9_-])(?:username|user|login|account|userid|user_id)(?![a-z0-9_-])"
         r"\s*[:=]\s*"
         r"[\"']?([A-Za-z0-9._@\-]{3,64})[\"']?"
     )
@@ -113,6 +113,19 @@ class WebReconSpider(scrapy.Spider):
         "**********",
     }
     CONTEXT_HINTS = {"auth", "password", "credential", "secret", "token", "apikey", "api_key", "login", "bearer"}
+    USERNAME_STOPWORDS = {
+        "before",
+        "after",
+        "none",
+        "null",
+        "undefined",
+        "inherit",
+        "initial",
+        "unset",
+        "auto",
+        "true",
+        "false",
+    }
 
     PASSWORD_PLACEHOLDERS = {
         "password",
@@ -134,6 +147,8 @@ class WebReconSpider(scrapy.Spider):
         "utm_campaign",
         "utm_term",
         "utm_content",
+        "_ga",
+        "_gl",
         "gclid",
         "fbclid",
         "mc_cid",
@@ -315,6 +330,21 @@ class WebReconSpider(scrapy.Spider):
         if lowered.startswith("${") or lowered.startswith("<"):
             return True
         if lowered.startswith("http://") or lowered.startswith("https://"):
+            return True
+        return False
+
+    @staticmethod
+    def _looks_like_asset_or_css_token(value):
+        lowered = value.lower()
+        if "://" in lowered:
+            return True
+        if lowered.startswith("sha256-") or lowered.startswith("sha384-") or lowered.startswith("sha512-"):
+            return True
+        if re.search(r"\.(?:css|js|map|svg|png|jpg|jpeg|gif|webp|woff2?|ttf|eot|ico)(?:$|[?#])", lowered):
+            return True
+        if "/" in lowered:
+            return True
+        if "__" in value or value.count(".") > 2 or ":" in value:
             return True
         return False
 
@@ -556,6 +586,8 @@ class WebReconSpider(scrapy.Spider):
             candidate = match.strip()
             if len(candidate) < 16 or self._is_placeholder(candidate):
                 continue
+            if self._looks_like_asset_or_css_token(candidate):
+                continue
             score, entropy = self._api_candidate_score(candidate)
             if candidate.isalpha() or score < 2:
                 continue
@@ -589,6 +621,10 @@ class WebReconSpider(scrapy.Spider):
             if cleaned.lower() in {"admin", "root", "user", "username", "login", "test"}:
                 continue
             if self._is_placeholder(cleaned):
+                continue
+            if cleaned.lower() in self.USERNAME_STOPWORDS:
+                continue
+            if self._looks_like_asset_or_css_token(cleaned):
                 continue
             self.results["usernames"].add(cleaned)
             self.scan_stats["username_matches"] += 1
@@ -641,6 +677,8 @@ class WebReconSpider(scrapy.Spider):
         value = unescape(value.strip())
         if not value or self._is_placeholder(value):
             return
+        if self._looks_like_asset_or_css_token(value):
+            return
 
         self.scan_stats["structured_kv_hits"] += 1
         context = self._snip_context(raw_text, value)
@@ -670,6 +708,8 @@ class WebReconSpider(scrapy.Spider):
 
         if any(k in key_l for k in self.USERNAME_KEYS):
             if len(value) <= 128 and not self._is_placeholder(value):
+                if value.lower() in self.USERNAME_STOPWORDS:
+                    return
                 self.results["usernames"].add(value)
                 self.scan_stats["username_matches"] += 1
                 self._record_finding(
@@ -687,10 +727,16 @@ class WebReconSpider(scrapy.Spider):
             self._classify_structured_kv(key, value, source_url, source_type, text)
 
     def _extract_entropy_secrets(self, text, source_url, source_type):
+        if source_type == "css":
+            return
         for token in self.GENERIC_SECRET_TOKEN_RE.findall(text):
-            if len(token) < 20 or len(token) > 180:
+            if len(token) < 24 or len(token) > 180:
                 continue
             if token.isdigit() or self._is_placeholder(token):
+                continue
+            if self._looks_like_asset_or_css_token(token):
+                continue
+            if not (any(c.isalpha() for c in token) and any(c.isdigit() for c in token)):
                 continue
             entropy = self._shannon_entropy(token)
             classes = sum(
@@ -701,10 +747,10 @@ class WebReconSpider(scrapy.Spider):
                     any(c in "-_./+=" for c in token),
                 ]
             )
-            if entropy < 4.0 or classes < 3:
+            if entropy < 4.35 or classes < 3:
                 continue
             self.scan_stats["entropy_secret_hits"] += 1
-            self.results["api_key_candidates"].add(token)
+            # Keep generic entropy hits out of top-level candidate list to reduce noisy false positives.
             self._record_finding(
                 "api_key_candidates",
                 token,
@@ -765,9 +811,11 @@ class WebReconSpider(scrapy.Spider):
 
         self._extract_ipv4(text, source_url, source_type)
         self._extract_api_keys(text, source_url, source_type)
-        self._extract_usernames(text, source_url, source_type)
-        self._extract_passwords(text, source_url, source_type)
-        self._extract_structured_assignments(text, source_url, source_type)
+        # CSS content generates excessive false positives for user/password-style patterns.
+        if source_type != "css":
+            self._extract_usernames(text, source_url, source_type)
+            self._extract_passwords(text, source_url, source_type)
+            self._extract_structured_assignments(text, source_url, source_type)
         self._extract_entropy_secrets(text, source_url, source_type)
         self._extract_jwt_and_private_keys(text, source_url, source_type)
 
@@ -789,6 +837,8 @@ class WebReconSpider(scrapy.Spider):
                         self.results["password_candidates"].add(candidate)
                         self._record_finding("password_candidates", candidate, "medium", url, "query", reasons=reasons)
                 if any(t in k for t in ["api", "token", "key", "auth", "bearer"]):
+                    if self._looks_like_asset_or_css_token(candidate):
+                        continue
                     score, entropy = self._api_candidate_score(candidate)
                     reasons = [f"query_key={k}", f"entropy={entropy:.2f}"]
                     if score >= 3:
@@ -800,6 +850,8 @@ class WebReconSpider(scrapy.Spider):
                         self._record_finding("api_key_candidates", candidate, "medium", url, "query", reasons=reasons)
                 if any(t in k for t in ["user", "login", "account", "email"]):
                     if len(candidate) <= 128:
+                        if candidate.lower() in self.USERNAME_STOPWORDS:
+                            continue
                         self.results["usernames"].add(candidate)
                         self.scan_stats["username_matches"] += 1
                         self._record_finding(
