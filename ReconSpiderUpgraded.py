@@ -33,7 +33,8 @@ class WebReconSpider(scrapy.Spider):
     # High-confidence provider token patterns
     API_PATTERNS = {
         "aws_access_key_id": re.compile(r"\b(?:AKIA|ASIA|AIDA|AROA|AGPA|AIPA|ANPA|ANVA)[A-Z0-9]{16}\b"),
-        "google_api_key": re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"),
+        # Accept common AIza formats and slight length variance seen in the wild.
+        "google_api_key": re.compile(r"(?<![A-Za-z0-9_-])AIza[0-9A-Za-z_-]{35,45}(?![A-Za-z0-9_-])"),
         "stripe_key": re.compile(r"\b(?:sk|rk|pk)_(?:live|test)_[0-9A-Za-z]{16,}\b"),
         "github_pat": re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,255}\b"),
         "github_token": re.compile(r"\bgh[pousr]_[A-Za-z0-9]{30,255}\b"),
