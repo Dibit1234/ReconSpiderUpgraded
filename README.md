@@ -1,2 +1,0 @@
-# ReconSpiderUpgraded
-A better reconspider.
