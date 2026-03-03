@@ -6,7 +6,7 @@ import shutil
 import sys
 import time
 from html import unescape
-from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qs, parse_qsl, unquote, urlencode, urlparse, urlunparse
 
 import scrapy
 from scrapy.crawler import CrawlerProcess
@@ -862,7 +862,8 @@ class WebReconSpider(scrapy.Spider):
             )
 
     def _extract_sensitive_data(self, text, source_url, source_type):
-        for email in self.EMAIL_RE.findall(text):
+        decoded_text = unescape(text)
+        for email in self.EMAIL_RE.findall(decoded_text):
             if self._is_placeholder_email(email):
                 continue
             self.results["emails"].add(email)
@@ -872,7 +873,7 @@ class WebReconSpider(scrapy.Spider):
                 "medium",
                 source_url,
                 source_type,
-                self._snip_context(text, email),
+                self._snip_context(decoded_text, email),
                 reasons=["email_pattern"],
             )
 
@@ -989,6 +990,22 @@ class WebReconSpider(scrapy.Spider):
                 links = response.css("a::attr(href)").getall()
                 for link in links:
                     if link.startswith("mailto:"):
+                        raw_mailto = link[len("mailto:") :].strip()
+                        address_block = unquote(raw_mailto.split("?", 1)[0])
+                        for candidate in [p.strip() for p in address_block.split(",") if p.strip()]:
+                            if not self.EMAIL_RE.fullmatch(candidate):
+                                continue
+                            if self._is_placeholder_email(candidate):
+                                continue
+                            self.results["emails"].add(candidate)
+                            self._record_finding(
+                                "emails",
+                                candidate,
+                                "medium",
+                                response.url,
+                                "mailto",
+                                reasons=["mailto_link"],
+                            )
                         continue
 
                     absolute = response.urljoin(link)
