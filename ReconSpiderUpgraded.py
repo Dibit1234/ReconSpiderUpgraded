@@ -28,6 +28,15 @@ class WebReconSpider(scrapy.Spider):
     name = "ReconSpiderUpgraded"
 
     EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
+    RELAXED_EMAIL_RE = re.compile(
+        r"(?ix)\b"
+        r"[a-z0-9._%+-]{1,64}\s*"
+        r"(?:@|\[\s*at\s*\]|\(\s*at\s*\)|\sat\s)\s*"
+        r"[a-z0-9.-]{1,253}\s*"
+        r"(?:\.|\[\s*dot\s*\]|\(\s*dot\s*\)|\sdot\s)\s*"
+        r"[a-z]{2,63}\b"
+    )
+    CFEMAIL_RE = re.compile(r"data-cfemail=[\"']([0-9a-fA-F]{6,})[\"']")
     IPV4_CANDIDATE_RE = re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])")
 
     # High-confidence provider token patterns
@@ -363,6 +372,44 @@ class WebReconSpider(scrapy.Spider):
         if local in self.PLACEHOLDER_EMAIL_LOCALS and domain in self.PLACEHOLDER_EMAIL_DOMAINS:
             return True
         return False
+
+    @staticmethod
+    def _normalize_obfuscated_email_candidate(value):
+        cleaned = unescape(unquote(value or "")).strip()
+        cleaned = re.sub(r"(?i)\[\s*at\s*\]|\(\s*at\s*\)|\sat\s", "@", cleaned)
+        cleaned = re.sub(r"(?i)\[\s*dot\s*\]|\(\s*dot\s*\)|\sdot\s", ".", cleaned)
+        cleaned = re.sub(r"\s+", "", cleaned)
+        return cleaned
+
+    @staticmethod
+    def _decode_cfemail(hex_blob):
+        try:
+            if len(hex_blob) < 4 or len(hex_blob) % 2 != 0:
+                return ""
+            key = int(hex_blob[:2], 16)
+            chars = []
+            for i in range(2, len(hex_blob), 2):
+                chars.append(chr(int(hex_blob[i : i + 2], 16) ^ key))
+            return "".join(chars)
+        except Exception:
+            return ""
+
+    def _record_email(self, email, source_url, source_type, text_for_context="", reason="email_pattern"):
+        normalized = self._normalize_obfuscated_email_candidate(email)
+        if not self.EMAIL_RE.fullmatch(normalized):
+            return
+        if self._is_placeholder_email(normalized):
+            return
+        self.results["emails"].add(normalized)
+        self._record_finding(
+            "emails",
+            normalized,
+            "medium",
+            source_url,
+            source_type,
+            self._snip_context(text_for_context, normalized) if text_for_context else "",
+            reasons=[reason],
+        )
 
     @staticmethod
     def _looks_like_asset_or_css_token(value):
@@ -862,20 +909,22 @@ class WebReconSpider(scrapy.Spider):
             )
 
     def _extract_sensitive_data(self, text, source_url, source_type):
-        decoded_text = unescape(text)
+        decoded_text = unescape(unquote(text))
+        normalized_text = self._normalize_obfuscated_email_candidate(decoded_text)
+
         for email in self.EMAIL_RE.findall(decoded_text):
-            if self._is_placeholder_email(email):
-                continue
-            self.results["emails"].add(email)
-            self._record_finding(
-                "emails",
-                email,
-                "medium",
-                source_url,
-                source_type,
-                self._snip_context(decoded_text, email),
-                reasons=["email_pattern"],
-            )
+            self._record_email(email, source_url, source_type, decoded_text, "email_pattern")
+
+        for email in self.EMAIL_RE.findall(normalized_text):
+            self._record_email(email, source_url, source_type, decoded_text, "email_obfuscation_normalized")
+
+        for candidate in self.RELAXED_EMAIL_RE.findall(decoded_text):
+            self._record_email(candidate, source_url, source_type, decoded_text, "email_relaxed_pattern")
+
+        for blob in self.CFEMAIL_RE.findall(text):
+            decoded = self._decode_cfemail(blob)
+            if decoded:
+                self._record_email(decoded, source_url, source_type, decoded_text, "cloudflare_cfemail")
 
         self._extract_ipv4(text, source_url, source_type)
         self._extract_api_keys(text, source_url, source_type)
@@ -993,19 +1042,7 @@ class WebReconSpider(scrapy.Spider):
                         raw_mailto = link[len("mailto:") :].strip()
                         address_block = unquote(raw_mailto.split("?", 1)[0])
                         for candidate in [p.strip() for p in address_block.split(",") if p.strip()]:
-                            if not self.EMAIL_RE.fullmatch(candidate):
-                                continue
-                            if self._is_placeholder_email(candidate):
-                                continue
-                            self.results["emails"].add(candidate)
-                            self._record_finding(
-                                "emails",
-                                candidate,
-                                "medium",
-                                response.url,
-                                "mailto",
-                                reasons=["mailto_link"],
-                            )
+                            self._record_email(candidate, response.url, "mailto", response.text, "mailto_link")
                         continue
 
                     absolute = response.urljoin(link)
