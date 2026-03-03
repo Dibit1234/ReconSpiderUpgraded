@@ -140,6 +140,15 @@ class WebReconSpider(scrapy.Spider):
         "********",
         "**********",
     }
+    PLACEHOLDER_EMAIL_DOMAINS = {
+        "example.com",
+        "example.org",
+        "example.net",
+        "company.com",
+        "domain.com",
+        "test.com",
+    }
+    PLACEHOLDER_EMAIL_LOCALS = {"example", "test", "admin", "user", "security", "name"}
 
     TRACKING_QUERY_KEYS = {
         "utm_source",
@@ -333,10 +342,33 @@ class WebReconSpider(scrapy.Spider):
             return True
         return False
 
+    def _is_placeholder_email(self, email):
+        lowered = email.strip().lower()
+        if "@" not in lowered:
+            return True
+        local, _, domain = lowered.partition("@")
+        if not local or not domain:
+            return True
+        if domain in self.PLACEHOLDER_EMAIL_DOMAINS:
+            return True
+        if local in self.PLACEHOLDER_EMAIL_LOCALS and domain.endswith(".com"):
+            return True
+        return False
+
     @staticmethod
     def _looks_like_asset_or_css_token(value):
         lowered = value.lower()
         if "://" in lowered:
+            return True
+        if lowered.startswith("sourceurl="):
+            return True
+        if lowered.startswith(("application/", "text/", "image/", "font/", "audio/", "video/")):
+            return True
+        if lowered.startswith(("family=", "ver=")):
+            return True
+        if lowered.startswith("wp-block-") or ".has-background-dim" in lowered or ".is-flex-container" in lowered:
+            return True
+        if lowered.startswith("object.prototype.") or ".prototype." in lowered:
             return True
         if lowered.startswith("sha256-") or lowered.startswith("sha384-") or lowered.startswith("sha512-"):
             return True
@@ -345,6 +377,26 @@ class WebReconSpider(scrapy.Spider):
         if "/" in lowered:
             return True
         if "__" in value or value.count(".") > 2 or ":" in value:
+            return True
+        return False
+
+    @staticmethod
+    def _is_likely_library_asset(source_url, source_type):
+        if source_type not in {"js", "css"}:
+            return False
+        lowered = source_url.lower()
+        if any(
+            marker in lowered
+            for marker in [
+                "cdn.jsdelivr.net",
+                "unpkg.com",
+                "cdnjs.cloudflare.com",
+                "/wp-includes/",
+                "/wp-content/plugins/",
+            ]
+        ):
+            return True
+        if ".min.js" in lowered or ".min.css" in lowered:
             return True
         return False
 
@@ -729,12 +781,16 @@ class WebReconSpider(scrapy.Spider):
     def _extract_entropy_secrets(self, text, source_url, source_type):
         if source_type == "css":
             return
+        if self._is_likely_library_asset(source_url, source_type):
+            return
         for token in self.GENERIC_SECRET_TOKEN_RE.findall(text):
             if len(token) < 24 or len(token) > 180:
                 continue
             if token.isdigit() or self._is_placeholder(token):
                 continue
             if self._looks_like_asset_or_css_token(token):
+                continue
+            if token.startswith(("wp-", "sourceURL=")):
                 continue
             if not (any(c.isalpha() for c in token) and any(c.isdigit() for c in token)):
                 continue
@@ -798,6 +854,8 @@ class WebReconSpider(scrapy.Spider):
 
     def _extract_sensitive_data(self, text, source_url, source_type):
         for email in self.EMAIL_RE.findall(text):
+            if self._is_placeholder_email(email):
+                continue
             self.results["emails"].add(email)
             self._record_finding(
                 "emails",
