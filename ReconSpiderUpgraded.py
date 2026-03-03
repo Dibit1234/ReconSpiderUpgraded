@@ -149,6 +149,13 @@ class WebReconSpider(scrapy.Spider):
         "test.com",
     }
     PLACEHOLDER_EMAIL_LOCALS = {"example", "test", "admin", "user", "security", "name"}
+    PLACEHOLDER_EMAIL_ADDRESSES = {
+        "security@company.com",
+        "admin@example.com",
+        "user@example.com",
+        "name@example.com",
+        "test@example.com",
+    }
 
     TRACKING_QUERY_KEYS = {
         "utm_source",
@@ -346,12 +353,14 @@ class WebReconSpider(scrapy.Spider):
         lowered = email.strip().lower()
         if "@" not in lowered:
             return True
+        if lowered in self.PLACEHOLDER_EMAIL_ADDRESSES:
+            return True
         local, _, domain = lowered.partition("@")
         if not local or not domain:
             return True
         if domain in self.PLACEHOLDER_EMAIL_DOMAINS:
             return True
-        if local in self.PLACEHOLDER_EMAIL_LOCALS and domain.endswith(".com"):
+        if local in self.PLACEHOLDER_EMAIL_LOCALS and domain in self.PLACEHOLDER_EMAIL_DOMAINS:
             return True
         return False
 
