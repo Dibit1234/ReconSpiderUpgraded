@@ -1,6 +1,6 @@
 # ReconSpiderUpgraded
 
-`ReconSpiderUpgraded` is a Scrapy-based reconnaissance crawler focused on surfacing potentially sensitive data in client-visible content.
+ReconSpiderUpgraded is a Scrapy-based reconnaissance crawler focused on surfacing potentially sensitive data in client-visible content.
 
 It scans HTML pages, inline scripts, comments, query strings, and same-domain JS/CSS assets for:
 
