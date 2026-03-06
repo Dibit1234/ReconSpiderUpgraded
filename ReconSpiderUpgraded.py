@@ -3,6 +3,7 @@ import json
 import math
 import re
 import shutil
+import signal
 import sys
 import time
 from html import unescape
@@ -209,7 +210,7 @@ class WebReconSpider(scrapy.Spider):
         llm="",
         llm_model="",
         llm_timeout=4.0,
-        llm_max_checks=250,
+        llm_max_checks=0,
         llm_validate_all=False,
         llm_relaxed=True,
         llm_test=False,
@@ -227,7 +228,7 @@ class WebReconSpider(scrapy.Spider):
         self.llm_endpoint = (llm or "").strip()
         self.llm_model = (llm_model or "").strip()
         self.llm_timeout = max(0.5, float(llm_timeout))
-        self.llm_max_checks = max(0, int(llm_max_checks))
+        self.llm_max_checks = int(llm_max_checks)
         self.llm_validate_all = self._as_bool(llm_validate_all)
         self.llm_relaxed = self._as_bool(llm_relaxed)
         self.llm_test = self._as_bool(llm_test)
@@ -419,7 +420,8 @@ class WebReconSpider(scrapy.Spider):
     def _llm_should_validate(self, kind, confidence):
         if not self.llm_enabled:
             return False
-        if self.scan_stats["llm_checks"] >= self.llm_max_checks:
+        # 0 or negative means unlimited checks.
+        if self.llm_max_checks > 0 and self.scan_stats["llm_checks"] >= self.llm_max_checks:
             self.scan_stats["llm_skipped_budget"] += 1
             return False
         if self.llm_validate_all:
@@ -450,7 +452,7 @@ class WebReconSpider(scrapy.Spider):
         c = (context or "").replace("\r", " ").replace("\n", " ").strip()[:120]
         if kind == "emails":
             return (
-                f"does this string fit standard email formats and look real not placeholder: {v} "
+                f"does this string fit standard email formats: {v} "
                 "respond yes or no, no other words at all"
             )
         if kind in {"api_keys", "api_key_candidates", "jwt_tokens", "private_key_markers"}:
@@ -534,10 +536,15 @@ class WebReconSpider(scrapy.Spider):
 
             verdict = self._llm_yes_no(answer)
             self._llm_debug_print("verify", prompt, answer)
-        except (urllib_error.URLError, urllib_error.HTTPError, TimeoutError, ValueError, OSError):
+        except (urllib_error.URLError, urllib_error.HTTPError, TimeoutError, ValueError, OSError) as exc:
             self.scan_stats["llm_errors"] += 1
-            self._llm_debug_print("verify", prompt, "request_error")
+            self._llm_debug_print("verify", prompt, f"request_error: {exc}")
             verdict = None
+
+        # Avoid obvious false negatives on syntactically valid emails.
+        if kind == "emails" and verdict is False:
+            if self.EMAIL_RE.fullmatch(str(value or "")) and not self._is_placeholder_email(str(value or "")):
+                verdict = True
 
         allowed = True if verdict is None else bool(verdict)
         if allowed:
@@ -1499,7 +1506,7 @@ def run_crawler(
     llm="",
     llm_model="",
     llm_timeout=4.0,
-    llm_max_checks=250,
+    llm_max_checks=0,
     llm_validate_all=False,
     llm_relaxed=True,
     llm_test=False,
@@ -1556,7 +1563,27 @@ def run_crawler(
         llm_relaxed=llm_relaxed,
         llm_test=llm_test,
     )
-    process.start()
+    stop_requested = {"value": False}
+
+    def _sigint_handler(signum, frame):
+        if not stop_requested["value"]:
+            stop_requested["value"] = True
+            sys.stdout.write("\nCtrl+C received. Stopping crawl...\n")
+            sys.stdout.flush()
+            process.stop()
+        else:
+            sys.stdout.write("\nSecond Ctrl+C received. Exiting now.\n")
+            sys.stdout.flush()
+            raise KeyboardInterrupt
+
+    prev_handler = signal.getsignal(signal.SIGINT)
+    signal.signal(signal.SIGINT, _sigint_handler)
+    try:
+        process.start(install_signal_handlers=False)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        signal.signal(signal.SIGINT, prev_handler)
 
 
 def print_banner(
@@ -1567,7 +1594,7 @@ def print_banner(
     stream_findings,
     llm="",
     llm_model="",
-    llm_max_checks=250,
+    llm_max_checks=0,
     llm_validate_all=False,
     llm_relaxed=True,
     llm_test=False,
@@ -1588,9 +1615,10 @@ def print_banner(
     print(f"Stream findings.jsonl: {stream_findings}")
     if llm:
         llm_scope = "all_findings" if bool(llm_validate_all) else "candidates_only"
+        llm_budget = "unlimited" if int(llm_max_checks) <= 0 else str(llm_max_checks)
         print(
             f"LLM verify: enabled endpoint={llm} model={llm_model or '<required>'} "
-            f"max_checks={llm_max_checks} scope={llm_scope} "
+            f"max_checks={llm_budget} scope={llm_scope} "
             f"relaxed={bool(llm_relaxed)} test={bool(llm_test)}"
         )
     else:
@@ -1644,8 +1672,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--llm-max-checks",
         type=int,
-        default=250,
-        help="Maximum LLM verification calls per scan (caps compute cost).",
+        default=0,
+        help="Maximum LLM verification calls per scan. Use 0 for unlimited.",
     )
     parser.add_argument(
         "--llm-validate-all",
