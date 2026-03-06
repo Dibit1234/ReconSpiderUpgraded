@@ -1,4 +1,5 @@
 import argparse
+import ipaddress
 import json
 import math
 import re
@@ -57,7 +58,23 @@ class WebReconSpider(scrapy.Spider):
         r"[a-z]{2,63}\b"
     )
     CFEMAIL_RE = re.compile(r"data-cfemail=[\"']([0-9a-fA-F]{6,})[\"']")
-    IPV4_CANDIDATE_RE = re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d.])")
+    IPV4_CANDIDATE_RE = re.compile(
+        r"(?<![\dA-Fa-f:.])"
+        r"(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)"
+        r"(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}"
+        r"(?![\dA-Fa-f:.])"
+    )
+    IPV6_CANDIDATE_RE = re.compile(r"(?i)(?<![0-9a-f:])(?:[0-9a-f]{0,4}:){2,7}[0-9a-f]{0,4}(?![0-9a-f:])")
+    LLM_REQUIRED_KINDS = {
+        "emails",
+        "usernames",
+        "passwords",
+        "password_candidates",
+        "api_keys",
+        "api_key_candidates",
+        "jwt_tokens",
+        "private_key_markers",
+    }
 
     # High-confidence provider token patterns
     API_PATTERNS = {
@@ -252,6 +269,7 @@ class WebReconSpider(scrapy.Spider):
         self.llm_enabled = bool(self.llm_endpoint)
         # In LLM mode, only keep findings explicitly approved by the model.
         self.llm_certified_only = self.llm_enabled
+        self.llm_required_only = self.llm_enabled
         self.llm_url = self._build_llm_url(self.llm_endpoint) if self.llm_enabled else ""
         self._llm_cache = {}
         self._llm_reject_enabled = True
@@ -382,6 +400,29 @@ class WebReconSpider(scrapy.Spider):
         return True
 
     @staticmethod
+    def _normalize_ip_candidate(value):
+        cleaned = (value or "").strip().strip("[](){}<>,;\"'")
+        if "%" in cleaned:
+            cleaned = cleaned.split("%", 1)[0]
+        return cleaned
+
+    @staticmethod
+    def _parse_ip(value):
+        try:
+            return ipaddress.ip_address(WebReconSpider._normalize_ip_candidate(value))
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _is_internal_ip(ip_obj):
+        return bool(
+            ip_obj.is_private
+            or ip_obj.is_loopback
+            or ip_obj.is_link_local
+            or ip_obj.is_reserved
+        )
+
+    @staticmethod
     def _is_likely_version_string(candidate):
         parts = [int(p) for p in candidate.split(".")]
         small_parts = sum(1 for p in parts if p <= 30)
@@ -442,8 +483,12 @@ class WebReconSpider(scrapy.Spider):
     def _llm_should_validate(self, kind, confidence):
         if not self.llm_enabled:
             return False
-        # 0 or negative means unlimited checks.
-        if self.llm_max_checks > 0 and self.scan_stats["llm_checks"] >= self.llm_max_checks:
+        is_required_kind = kind in self.LLM_REQUIRED_KINDS
+        # In LLM mode, restrict checks to required high-value secret/credential categories.
+        if self.llm_required_only and not is_required_kind:
+            return False
+        # Ensure required kinds are always checked. Budget caps apply only to non-required kinds.
+        if (not is_required_kind) and self.llm_max_checks > 0 and self.scan_stats["llm_checks"] >= self.llm_max_checks:
             self.scan_stats["llm_skipped_budget"] += 1
             return False
         if self.llm_certified_only:
@@ -1011,38 +1056,39 @@ class WebReconSpider(scrapy.Spider):
         sys.stdout.flush()
 
     def _record_private_ips_first(self, ips):
-        private = []
+        internal = []
         public = []
         for ip in ips:
-            if ip.startswith("10."):
-                private.append(ip)
+            parsed = self._parse_ip(ip)
+            if not parsed:
                 continue
-            if ip.startswith("192.168."):
-                private.append(ip)
-                continue
-            if ip.startswith("172."):
-                second = int(ip.split(".")[1])
-                if 16 <= second <= 31:
-                    private.append(ip)
-                    continue
-            public.append(ip)
-        return sorted(set(private)) + sorted(set(public))
+            if self._is_internal_ip(parsed):
+                internal.append(str(parsed))
+            else:
+                public.append(str(parsed))
+        return sorted(set(internal)) + sorted(set(public))
 
-    def _extract_ipv4(self, text, source_url, source_type):
-        for candidate in self.IPV4_CANDIDATE_RE.findall(text):
-            if not self._is_valid_ipv4(candidate):
+    def _extract_ip_addresses(self, text, source_url, source_type):
+        ipv4_candidates = self.IPV4_CANDIDATE_RE.findall(text)
+        ipv6_candidates = self.IPV6_CANDIDATE_RE.findall(text)
+        for candidate in set(ipv4_candidates + ipv6_candidates):
+            parsed = self._parse_ip(candidate)
+            if not parsed:
                 continue
-            if self._is_likely_version_string(candidate):
+            normalized = str(parsed)
+            if parsed.version == 4 and self._is_likely_version_string(normalized):
                 continue
-            self.results["ip_addresses"].add(candidate)
+            self.results["ip_addresses"].add(normalized)
             self.scan_stats["ip_matches"] += 1
+            reasons = ["internal_ip" if self._is_internal_ip(parsed) else "public_ip"]
             self._record_finding(
                 "ip_addresses",
-                candidate,
+                normalized,
                 "high",
                 source_url,
                 source_type,
                 self._snip_context(text, candidate),
+                reasons=reasons,
             )
 
     def _extract_api_keys(self, text, source_url, source_type):
@@ -1313,7 +1359,7 @@ class WebReconSpider(scrapy.Spider):
             if decoded:
                 self._record_email(decoded, source_url, source_type, decoded_text, "cloudflare_cfemail")
 
-        self._extract_ipv4(text, source_url, source_type)
+        self._extract_ip_addresses(text, source_url, source_type)
         self._extract_api_keys(text, source_url, source_type)
         # CSS content generates excessive false positives for user/password-style patterns.
         if source_type != "css":
@@ -1697,11 +1743,13 @@ def print_banner(
     if llm:
         llm_scope = "all_findings" if bool(llm_validate_all) else "candidates_only"
         llm_budget = "unlimited" if int(llm_max_checks) <= 0 else str(llm_max_checks)
+        llm_required = ",".join(sorted(WebReconSpider.LLM_REQUIRED_KINDS))
         print(
             f"LLM verify: enabled endpoint={llm} model={llm_model or '<required>'} "
             f"max_checks={llm_budget} scope={llm_scope} "
             f"relaxed={bool(llm_relaxed)} test={bool(llm_test)} mode=certified_only"
         )
+        print(f"LLM required checks: {llm_required}")
     else:
         print("LLM verify: disabled")
     print("Features: normalized dedupe, asset scanning, confidence scoring, live progress")
