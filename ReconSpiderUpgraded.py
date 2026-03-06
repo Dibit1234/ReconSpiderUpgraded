@@ -29,6 +29,17 @@ class CustomOffsiteMiddleware(OffsiteMiddleware):
 
 class WebReconSpider(scrapy.Spider):
     name = "ReconSpiderUpgraded"
+    ANSI = {
+        "reset": "\033[0m",
+        "bold": "\033[1m",
+        "dim": "\033[2m",
+        "red": "\033[31m",
+        "green": "\033[32m",
+        "yellow": "\033[33m",
+        "blue": "\033[34m",
+        "cyan": "\033[36m",
+        "gray": "\033[90m",
+    }
 
     EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
     RELAXED_EMAIL_RE = re.compile(
@@ -235,6 +246,8 @@ class WebReconSpider(scrapy.Spider):
         self.llm_enabled = bool(self.llm_endpoint)
         self.llm_url = self._build_llm_url(self.llm_endpoint) if self.llm_enabled else ""
         self._llm_cache = {}
+        self._llm_reject_enabled = True
+        self._llm_guardrail_announced = False
         self.llm_probe_status = "disabled"
         self.llm_probe_detail = ""
         self.llm_probe_latency_ms = 0
@@ -319,6 +332,7 @@ class WebReconSpider(scrapy.Spider):
             "llm_skipped_budget": 0,
             "llm_probe_attempts": 0,
             "llm_probe_success": 0,
+            "llm_guardrail_trips": 0,
             "elapsed_seconds": 0.0,
             "pages_per_second": 0.0,
         }
@@ -432,19 +446,31 @@ class WebReconSpider(scrapy.Spider):
 
     @staticmethod
     def _llm_yes_no(text):
-        lowered = (text or "").strip().lower()
-        if not lowered:
+        raw = (text or "").strip()
+        if not raw:
             return None
-        token = lowered.split()[0].strip("`\"'.:;!?,")
+        lowered = raw.lower()
+        token_match = re.search(r"[a-z]+", lowered)
+        if not token_match:
+            return None
+        token = token_match.group(0)
         if token.startswith("yes"):
             return True
         if token.startswith("no"):
             return False
-        if " yes" in f" {lowered}":
+        if re.search(r"\byes\b", lowered):
             return True
-        if " no" in f" {lowered}":
+        if re.search(r"\bno\b", lowered):
             return False
         return None
+
+    def _color(self, text, color):
+        if not sys.stdout.isatty():
+            return text
+        code = self.ANSI.get(color, "")
+        if not code:
+            return text
+        return f"{code}{text}{self.ANSI['reset']}"
 
     def _llm_prompt(self, kind, value, confidence, source_type, reasons, context):
         # Keep prompts compact to reduce latency/compute on local models.
@@ -452,27 +478,27 @@ class WebReconSpider(scrapy.Spider):
         c = (context or "").replace("\r", " ").replace("\n", " ").strip()[:120]
         if kind == "emails":
             return (
-                f"does this string fit standard email formats: {v} "
-                "respond yes or no, no other words at all"
+                f"string: {v} | is this a valid real email (not placeholder)? "
+                "answer exactly yes or no"
             )
         if kind in {"api_keys", "api_key_candidates", "jwt_tokens", "private_key_markers"}:
             return (
-                f"is this likely a real secret/token and not an asset path/example/noise: {v} "
-                f"context: {c} respond yes or no, no other words at all"
+                f"string: {v} | context: {c} | is this likely a real secret/token? "
+                "answer exactly yes or no"
             )
         if kind in {"passwords", "password_candidates"}:
             return (
-                f"is this likely a real password/credential and not placeholder/example/noise: {v} "
-                f"context: {c} respond yes or no, no other words at all"
+                f"string: {v} | context: {c} | is this likely a real password/credential? "
+                "answer exactly yes or no"
             )
         if kind == "usernames":
             return (
-                f"is this likely a real username/account identifier and not css/template/noise: {v} "
-                f"context: {c} respond yes or no, no other words at all"
+                f"string: {v} | context: {c} | is this likely a real username/account identifier? "
+                "answer exactly yes or no"
             )
         return (
-            f"is this likely a real security finding and not placeholder/noise: {v} "
-            f"context: {c} respond yes or no, no other words at all"
+            f"string: {v} | context: {c} | is this likely a real security finding? "
+            "answer exactly yes or no"
         )
 
     def _llm_debug_print(self, label, prompt_text, response_text):
@@ -480,8 +506,8 @@ class WebReconSpider(scrapy.Spider):
             return
         prompt_clean = (prompt_text or "").replace("\r", " ").replace("\n", " ").strip()
         response_clean = (response_text or "").replace("\r", " ").replace("\n", " ").strip()
-        print(f"[LLM-TEST] {label} prompt: {prompt_clean[:600]}")
-        print(f"[LLM-TEST] {label} response: {response_clean[:200]}")
+        print(self._color(f"[LLM-TEST] {label} prompt: {prompt_clean[:600]}", "cyan"))
+        print(self._color(f"[LLM-TEST] {label} response: {response_clean[:200]}", "yellow"))
 
     def _llm_verify_finding(self, kind, value, confidence, source_type, reasons, context):
         cache_key = (kind, value, confidence, source_type)
@@ -546,7 +572,26 @@ class WebReconSpider(scrapy.Spider):
             if self.EMAIL_RE.fullmatch(str(value or "")) and not self._is_placeholder_email(str(value or "")):
                 verdict = True
 
-        allowed = True if verdict is None else bool(verdict)
+        if verdict is False and self.scan_stats["llm_checks"] >= 12:
+            no_rate = self.scan_stats["llm_no"] / max(self.scan_stats["llm_checks"], 1)
+            if no_rate >= 0.95 and self.scan_stats["llm_yes"] <= 1:
+                self._llm_reject_enabled = False
+                self.scan_stats["llm_guardrail_trips"] += 1
+                if not self._llm_guardrail_announced:
+                    self._llm_guardrail_announced = True
+                    print(
+                        self._color(
+                            "[LLM] guardrail: model is returning near-all 'no'; switching to fail-open",
+                            "yellow",
+                        )
+                    )
+
+        if verdict is None:
+            allowed = True
+        elif verdict is False and not self._llm_reject_enabled:
+            allowed = True
+        else:
+            allowed = bool(verdict)
         if allowed:
             self.scan_stats["llm_yes"] += 1
         else:
@@ -619,15 +664,20 @@ class WebReconSpider(scrapy.Spider):
     def _print_llm_probe_status(self):
         status = self.llm_probe_status
         if status == "ok":
+            print(self._color("[LLM] probe=ok", "green"), end=" ")
             print(
-                f"[LLM] probe=ok model={self.llm_model} endpoint={self.llm_url} "
-                f"latency={self.llm_probe_latency_ms}ms reply={self.llm_probe_detail}"
+                f"model={self.llm_model} endpoint={self.llm_url} "
+                f"{self._color(f'latency={self.llm_probe_latency_ms}ms', 'cyan')} "
+                f"reply={self.llm_probe_detail}"
             )
             return
+        color = "yellow" if status == "unexpected" else "red"
+        print(self._color(f"[LLM] probe={status}", color), end=" ")
         print(
-            f"[LLM] probe={status} model={self.llm_model} endpoint={self.llm_url} "
-            f"latency={self.llm_probe_latency_ms}ms detail={self.llm_probe_detail} "
-            f"(scan continues in fail-open mode)"
+            f"model={self.llm_model} endpoint={self.llm_url} "
+            f"{self._color(f'latency={self.llm_probe_latency_ms}ms', 'cyan')} "
+            f"detail={self.llm_probe_detail} "
+            f"{self._color('(scan continues in fail-open mode)', 'dim')}"
         )
 
     def _is_placeholder_email(self, email):
@@ -912,16 +962,25 @@ class WebReconSpider(scrapy.Spider):
         bar_width = max(12, min(28, term_width // 5))
         bar = self._render_progress_bar(pct, width=bar_width)
 
+        llm_block = (
+            f"llm={self.scan_stats['llm_checks']}/{self.scan_stats['llm_yes']}/"
+            f"{self.scan_stats['llm_no']}/{self.scan_stats['llm_errors']}"
+        )
+        if self.llm_enabled:
+            llm_block = self._color(llm_block, "cyan")
+
         line = (
-            f"{spin} {bar} {pct * 100:6.2f}% "
-            f"pages={pages}/{self.max_pages} text={self.scan_stats['text_pages_scanned']} "
-            f"found={found_total} ips={len(self.results['ip_addresses'])} "
+            f"{self._color(spin, 'blue')} {self._color(bar, 'green')} "
+            f"{self._color(f'{pct * 100:6.2f}%', 'bold')} "
+            f"{self._color(f'pages={pages}/{self.max_pages}', 'gray')} "
+            f"text={self.scan_stats['text_pages_scanned']} "
+            f"{self._color(f'found={found_total}', 'green')} "
+            f"ips={len(self.results['ip_addresses'])} "
             f"api={self._format_pair(len(self.results['api_keys']), len(self.results['api_key_candidates']))} "
             f"pass={self._format_pair(len(self.results['passwords']), len(self.results['password_candidates']))} "
             f"users={len(self.results['usernames'])} "
-            f"llm={self.scan_stats['llm_checks']}/{self.scan_stats['llm_yes']}/"
-            f"{self.scan_stats['llm_no']}/{self.scan_stats['llm_errors']} "
-            f"rate={pages / elapsed:5.1f}/s"
+            f"{llm_block} "
+            f"{self._color(f'rate={pages / elapsed:5.1f}/s', 'dim')}"
         )
         clipped = line[: term_width - 1]
         sys.stdout.write("\r\033[2K" + clipped)
@@ -1465,9 +1524,10 @@ class WebReconSpider(scrapy.Spider):
             self.findings_stream_handle.flush()
             self.findings_stream_handle.close()
 
-        sys.stdout.write("\n\nScan complete. Results saved to results.json\n")
+        complete_msg = "Scan complete. Results saved to results.json"
+        sys.stdout.write(f"\n\n{self._color(complete_msg, 'green')}\n")
         if self.stream_findings:
-            sys.stdout.write(f"Streaming findings: {self.findings_stream_path}\n")
+            sys.stdout.write(f"{self._color('Streaming findings:', 'cyan')} {self.findings_stream_path}\n")
         sys.stdout.write(
             "Summary: pages={pages} text={text} emails={emails} ips={ips} api={api} "
             "pass={pwd} users={users} jwt={jwt} pkey={pkey} assets={assets} llm={llm}\n".format(
