@@ -445,18 +445,32 @@ class WebReconSpider(scrapy.Spider):
         return None
 
     def _llm_prompt(self, kind, value, confidence, source_type, reasons, context):
-        reasons_text = ", ".join(reasons or [])
-        context_text = (context or "")[:180]
+        # Keep prompts compact to reduce latency/compute on local models.
+        v = (value or "").strip()[:220]
+        c = (context or "").replace("\r", " ").replace("\n", " ").strip()[:120]
+        if kind == "emails":
+            return (
+                f"does this string fit standard email formats and look real not placeholder: {v} "
+                "respond yes or no, no other words at all"
+            )
+        if kind in {"api_keys", "api_key_candidates", "jwt_tokens", "private_key_markers"}:
+            return (
+                f"is this likely a real secret/token and not an asset path/example/noise: {v} "
+                f"context: {c} respond yes or no, no other words at all"
+            )
+        if kind in {"passwords", "password_candidates"}:
+            return (
+                f"is this likely a real password/credential and not placeholder/example/noise: {v} "
+                f"context: {c} respond yes or no, no other words at all"
+            )
+        if kind == "usernames":
+            return (
+                f"is this likely a real username/account identifier and not css/template/noise: {v} "
+                f"context: {c} respond yes or no, no other words at all"
+            )
         return (
-            "You are a security finding verifier. "
-            "Answer strictly with one word: yes or no.\n"
-            f"Type: {kind}\n"
-            f"Confidence: {confidence}\n"
-            f"Source: {source_type}\n"
-            f"Value: {value}\n"
-            f"Reasons: {reasons_text}\n"
-            f"Context: {context_text}\n"
-            "Is this likely a real sensitive/security finding?"
+            f"is this likely a real security finding and not placeholder/noise: {v} "
+            f"context: {c} respond yes or no, no other words at all"
         )
 
     def _llm_debug_print(self, label, prompt_text, response_text):
@@ -1561,20 +1575,22 @@ def print_banner(
     if not sys.stdout.isatty():
         return
     banner = r"""
- ____  _____ ____ ___  _   _   ____  ____  ___ ____  _____ ____   _   _ ____  ____    _  _____ _____ ____
-|  _ \| ____/ ___/ _ \| \ | | / ___||  _ \|_ _|  _ \| ____|  _ \ | | | |  _ \|  _ \  / \|_   _| ____|  _ \
-| |_) |  _|| |  | | | |  \| | \___ \| |_) || || | | |  _| | | | || | | | |_) | | | |/ _ \ | | |  _| | | | |
-|  _ <| |__| |__| |_| | |\  |  ___) |  __/ | || |_| | |___| |_| || |_| |  __/| |_| / ___ \| | | |___| |_| |
-|_| \_\_____\____\___/|_| \_| |____/|_|   |___|____/|_____|____/  \___/|_|   |____/_/   \_\_| |_____|____/
+  ____                             ____        _     _
+ |  _ \ ___  ___ ___  _ __       / ___| _ __ (_) __| | ___ _ __
+ | |_) / _ \/ __/ _ \| '_ \ _____\___ \| '_ \| |/ _` |/ _ \ '__|
+ |  _ <  __/ (_| (_) | | | |_____|___) | |_) | | (_| |  __/ |
+ |_| \_\___|\___\___/|_| |_|     |____/| .__/|_|\__,_|\___|_|
+                                        |_|
 """
     print(banner)
     print(f"{APP_NAME} v{APP_VERSION} | Target: {start_url}")
     print(f"Max pages: {max_pages} | Max text bytes: {max_text_bytes} | Verbose: {verbose}")
     print(f"Stream findings.jsonl: {stream_findings}")
     if llm:
+        llm_scope = "all_findings" if bool(llm_validate_all) else "candidates_only"
         print(
             f"LLM verify: enabled endpoint={llm} model={llm_model or '<required>'} "
-            f"max_checks={llm_max_checks} validate_all={bool(llm_validate_all)} "
+            f"max_checks={llm_max_checks} scope={llm_scope} "
             f"relaxed={bool(llm_relaxed)} test={bool(llm_test)}"
         )
     else:
