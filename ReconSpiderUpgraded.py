@@ -212,6 +212,7 @@ class WebReconSpider(scrapy.Spider):
         llm_max_checks=250,
         llm_validate_all=False,
         llm_relaxed=True,
+        llm_test=False,
         *args,
         **kwargs,
     ):
@@ -229,9 +230,13 @@ class WebReconSpider(scrapy.Spider):
         self.llm_max_checks = max(0, int(llm_max_checks))
         self.llm_validate_all = self._as_bool(llm_validate_all)
         self.llm_relaxed = self._as_bool(llm_relaxed)
+        self.llm_test = self._as_bool(llm_test)
         self.llm_enabled = bool(self.llm_endpoint)
         self.llm_url = self._build_llm_url(self.llm_endpoint) if self.llm_enabled else ""
         self._llm_cache = {}
+        self.llm_probe_status = "disabled"
+        self.llm_probe_detail = ""
+        self.llm_probe_latency_ms = 0
 
         # Canonicalized URL dedupe
         self.visited_urls = set()
@@ -311,6 +316,8 @@ class WebReconSpider(scrapy.Spider):
             "llm_errors": 0,
             "llm_cache_hits": 0,
             "llm_skipped_budget": 0,
+            "llm_probe_attempts": 0,
+            "llm_probe_success": 0,
             "elapsed_seconds": 0.0,
             "pages_per_second": 0.0,
         }
@@ -327,6 +334,10 @@ class WebReconSpider(scrapy.Spider):
 
         if not self.verbose:
             self.logger.setLevel("WARNING")
+
+        if self.llm_enabled:
+            self._run_llm_probe()
+            self._print_llm_probe_status()
 
     @staticmethod
     def _as_bool(value):
@@ -448,6 +459,14 @@ class WebReconSpider(scrapy.Spider):
             "Is this likely a real sensitive/security finding?"
         )
 
+    def _llm_debug_print(self, label, prompt_text, response_text):
+        if not (self.llm_enabled and self.llm_test):
+            return
+        prompt_clean = (prompt_text or "").replace("\r", " ").replace("\n", " ").strip()
+        response_clean = (response_text or "").replace("\r", " ").replace("\n", " ").strip()
+        print(f"[LLM-TEST] {label} prompt: {prompt_clean[:600]}")
+        print(f"[LLM-TEST] {label} response: {response_clean[:200]}")
+
     def _llm_verify_finding(self, kind, value, confidence, source_type, reasons, context):
         cache_key = (kind, value, confidence, source_type)
         if cache_key in self._llm_cache:
@@ -500,8 +519,10 @@ class WebReconSpider(scrapy.Spider):
                     answer = str(msg.get("content", ""))
 
             verdict = self._llm_yes_no(answer)
+            self._llm_debug_print("verify", prompt, answer)
         except (urllib_error.URLError, urllib_error.HTTPError, TimeoutError, ValueError, OSError):
             self.scan_stats["llm_errors"] += 1
+            self._llm_debug_print("verify", prompt, "request_error")
             verdict = None
 
         allowed = True if verdict is None else bool(verdict)
@@ -511,6 +532,82 @@ class WebReconSpider(scrapy.Spider):
             self.scan_stats["llm_no"] += 1
         self._llm_cache[cache_key] = allowed
         return allowed
+
+    def _run_llm_probe(self):
+        self.scan_stats["llm_probe_attempts"] += 1
+        probe_start = time.time()
+        verdict = None
+        detail = ""
+        try:
+            probe_prompt = "Reply with one word only: yes"
+            if self._is_ollama_generate_url(self.llm_url):
+                payload = {
+                    "model": self.llm_model,
+                    "prompt": probe_prompt,
+                    "stream": False,
+                    "options": {"temperature": 0, "num_predict": 1},
+                }
+            else:
+                payload = {
+                    "model": self.llm_model,
+                    "temperature": 0,
+                    "max_tokens": 1,
+                    "messages": [
+                        {"role": "system", "content": "Return only one word: yes or no."},
+                        {"role": "user", "content": probe_prompt},
+                    ],
+                }
+            body = json.dumps(payload).encode("utf-8")
+            req = urllib_request.Request(
+                self.llm_url,
+                data=body,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            probe_timeout = min(self.llm_timeout, 3.0)
+            with urllib_request.urlopen(req, timeout=probe_timeout) as response:
+                raw = response.read().decode("utf-8", errors="ignore")
+            data = json.loads(raw)
+            if self._is_ollama_generate_url(self.llm_url):
+                answer = str(data.get("response", ""))
+            else:
+                answer = ""
+                choices = data.get("choices") or []
+                if choices:
+                    msg = choices[0].get("message") or {}
+                    answer = str(msg.get("content", ""))
+            verdict = self._llm_yes_no(answer)
+            detail = answer.strip()[:32]
+            self._llm_debug_print("probe", probe_prompt, answer)
+        except (urllib_error.URLError, urllib_error.HTTPError, TimeoutError, ValueError, OSError) as exc:
+            detail = str(exc).strip()[:120]
+            self._llm_debug_print("probe", probe_prompt, detail)
+
+        self.llm_probe_latency_ms = int((time.time() - probe_start) * 1000)
+        if verdict is True:
+            self.llm_probe_status = "ok"
+            self.llm_probe_detail = detail or "yes"
+            self.scan_stats["llm_probe_success"] += 1
+        elif verdict is False:
+            self.llm_probe_status = "unexpected"
+            self.llm_probe_detail = detail or "no"
+        else:
+            self.llm_probe_status = "error"
+            self.llm_probe_detail = detail or "no valid reply"
+
+    def _print_llm_probe_status(self):
+        status = self.llm_probe_status
+        if status == "ok":
+            print(
+                f"[LLM] probe=ok model={self.llm_model} endpoint={self.llm_url} "
+                f"latency={self.llm_probe_latency_ms}ms reply={self.llm_probe_detail}"
+            )
+            return
+        print(
+            f"[LLM] probe={status} model={self.llm_model} endpoint={self.llm_url} "
+            f"latency={self.llm_probe_latency_ms}ms detail={self.llm_probe_detail} "
+            f"(scan continues in fail-open mode)"
+        )
 
     def _is_placeholder_email(self, email):
         lowered = email.strip().lower()
@@ -777,9 +874,16 @@ class WebReconSpider(scrapy.Spider):
             if pages - self._last_progress_emit < 50 and pages != self.max_pages:
                 return
             self._last_progress_emit = pages
+            llm_info = ""
+            if self.llm_enabled:
+                llm_info = (
+                    f" llm={self.scan_stats['llm_checks']} "
+                    f"yes={self.scan_stats['llm_yes']} no={self.scan_stats['llm_no']} "
+                    f"err={self.scan_stats['llm_errors']}"
+                )
             print(
                 f"progress {pct * 100:6.2f}% pages={pages}/{self.max_pages} "
-                f"text={self.scan_stats['text_pages_scanned']} found={found_total}"
+                f"text={self.scan_stats['text_pages_scanned']} found={found_total}{llm_info}"
             )
             return
 
@@ -793,7 +897,10 @@ class WebReconSpider(scrapy.Spider):
             f"found={found_total} ips={len(self.results['ip_addresses'])} "
             f"api={self._format_pair(len(self.results['api_keys']), len(self.results['api_key_candidates']))} "
             f"pass={self._format_pair(len(self.results['passwords']), len(self.results['password_candidates']))} "
-            f"users={len(self.results['usernames'])} rate={pages / elapsed:5.1f}/s"
+            f"users={len(self.results['usernames'])} "
+            f"llm={self.scan_stats['llm_checks']}/{self.scan_stats['llm_yes']}/"
+            f"{self.scan_stats['llm_no']}/{self.scan_stats['llm_errors']} "
+            f"rate={pages / elapsed:5.1f}/s"
         )
         clipped = line[: term_width - 1]
         sys.stdout.write("\r\033[2K" + clipped)
@@ -851,7 +958,8 @@ class WebReconSpider(scrapy.Spider):
 
         for match in self.API_CONTEXT_RE.findall(text):
             candidate = match.strip()
-            if len(candidate) < 16 or self._is_placeholder(candidate):
+            min_len = 10 if (self.llm_enabled and self.llm_relaxed) else 16
+            if len(candidate) < min_len or self._is_placeholder(candidate):
                 continue
             if self._looks_like_asset_or_css_token(candidate):
                 continue
@@ -1033,7 +1141,9 @@ class WebReconSpider(scrapy.Spider):
                     any(c in "-_./+=" for c in token),
                 ]
             )
-            if entropy < 4.35 or classes < 3:
+            entropy_threshold = 3.8 if (self.llm_enabled and self.llm_relaxed) else 4.35
+            class_threshold = 2 if (self.llm_enabled and self.llm_relaxed) else 3
+            if entropy < entropy_threshold or classes < class_threshold:
                 continue
             if len(token) < 28 and not self.llm_enabled:
                 continue
@@ -1378,6 +1488,7 @@ def run_crawler(
     llm_max_checks=250,
     llm_validate_all=False,
     llm_relaxed=True,
+    llm_test=False,
 ):
     verbose = WebReconSpider._as_bool(verbose)
     stream_findings = WebReconSpider._as_bool(stream_findings)
@@ -1416,6 +1527,7 @@ def run_crawler(
         llm_max_checks=llm_max_checks,
         llm_validate_all=llm_validate_all,
         llm_relaxed=llm_relaxed,
+        llm_test=llm_test,
     )
     print_banner(
         start_url,
@@ -1428,6 +1540,7 @@ def run_crawler(
         llm_max_checks=llm_max_checks,
         llm_validate_all=llm_validate_all,
         llm_relaxed=llm_relaxed,
+        llm_test=llm_test,
     )
     process.start()
 
@@ -1443,6 +1556,7 @@ def print_banner(
     llm_max_checks=250,
     llm_validate_all=False,
     llm_relaxed=True,
+    llm_test=False,
 ):
     if not sys.stdout.isatty():
         return
@@ -1460,7 +1574,8 @@ def print_banner(
     if llm:
         print(
             f"LLM verify: enabled endpoint={llm} model={llm_model or '<required>'} "
-            f"max_checks={llm_max_checks} validate_all={bool(llm_validate_all)} relaxed={bool(llm_relaxed)}"
+            f"max_checks={llm_max_checks} validate_all={bool(llm_validate_all)} "
+            f"relaxed={bool(llm_relaxed)} test={bool(llm_test)}"
         )
     else:
         print("LLM verify: disabled")
@@ -1526,6 +1641,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Disable relaxed candidate collection when LLM is enabled.",
     )
+    parser.add_argument(
+        "--test",
+        action="store_true",
+        help="LLM debug mode: print prompt snippets and raw LLM replies in CLI.",
+    )
     args = parser.parse_args()
 
     if args.llm and not args.llm_model:
@@ -1543,4 +1663,5 @@ if __name__ == "__main__":
         llm_max_checks=args.llm_max_checks,
         llm_validate_all=args.llm_validate_all,
         llm_relaxed=not args.no_llm_relaxed,
+        llm_test=args.test,
     )
