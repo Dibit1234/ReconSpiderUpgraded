@@ -41,7 +41,13 @@ class WebReconSpider(scrapy.Spider):
         "gray": "\033[90m",
     }
 
-    EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
+    EMAIL_RE = re.compile(
+        r"(?i)\b"
+        r"[a-z0-9._%+-]{1,64}"
+        r"@"
+        r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+        r"[a-z]{2,24}\b"
+    )
     RELAXED_EMAIL_RE = re.compile(
         r"(?ix)\b"
         r"[a-z0-9._%+-]{1,64}\s*"
@@ -579,11 +585,6 @@ class WebReconSpider(scrapy.Spider):
             self._llm_debug_print("verify", prompt, f"request_error: {exc}")
             verdict = None
 
-        # Avoid obvious false negatives on syntactically valid emails.
-        if kind == "emails" and verdict is False:
-            if self.EMAIL_RE.fullmatch(str(value or "")) and not self._is_placeholder_email(str(value or "")):
-                verdict = True
-
         if (not self.llm_certified_only) and verdict is False and self.scan_stats["llm_checks"] >= 12:
             no_rate = self.scan_stats["llm_no"] / max(self.scan_stats["llm_checks"], 1)
             if no_rate >= 0.95 and self.scan_stats["llm_yes"] <= 1:
@@ -716,6 +717,8 @@ class WebReconSpider(scrapy.Spider):
         cleaned = unescape(unquote(value or "")).strip()
         cleaned = re.sub(r"(?i)\[\s*at\s*\]|\(\s*at\s*\)|\sat\s", "@", cleaned)
         cleaned = re.sub(r"(?i)\[\s*dot\s*\]|\(\s*dot\s*\)|\sdot\s", ".", cleaned)
+        cleaned = re.sub(r"\s*@\s*", "@", cleaned)
+        cleaned = re.sub(r"\s*\.\s*", ".", cleaned)
         cleaned = re.sub(r"\s+", "", cleaned)
         return cleaned
 
@@ -1297,16 +1300,13 @@ class WebReconSpider(scrapy.Spider):
 
     def _extract_sensitive_data(self, text, source_url, source_type):
         decoded_text = unescape(unquote(text))
-        normalized_text = self._normalize_obfuscated_email_candidate(decoded_text)
 
         for email in self.EMAIL_RE.findall(decoded_text):
             self._record_email(email, source_url, source_type, decoded_text, "email_pattern")
 
-        for email in self.EMAIL_RE.findall(normalized_text):
-            self._record_email(email, source_url, source_type, decoded_text, "email_obfuscation_normalized")
-
         for candidate in self.RELAXED_EMAIL_RE.findall(decoded_text):
-            self._record_email(candidate, source_url, source_type, decoded_text, "email_relaxed_pattern")
+            normalized = self._normalize_obfuscated_email_candidate(candidate)
+            self._record_email(normalized, source_url, source_type, decoded_text, "email_obfuscation_normalized")
 
         for blob in self.CFEMAIL_RE.findall(text):
             decoded = self._decode_cfemail(blob)
