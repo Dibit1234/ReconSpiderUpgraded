@@ -509,6 +509,14 @@ class WebReconSpider(scrapy.Spider):
         print(self._color(f"[LLM-TEST] {label} prompt: {prompt_clean[:600]}", "cyan"))
         print(self._color(f"[LLM-TEST] {label} response: {response_clean[:200]}", "yellow"))
 
+    def _llm_probe_preview_print(self, prompt_text, response_text):
+        if not self.llm_enabled:
+            return
+        prompt_clean = (prompt_text or "").replace("\r", " ").replace("\n", " ").strip()
+        response_clean = (response_text or "").replace("\r", " ").replace("\n", " ").strip()
+        print(self._color(f"[LLM-PROBE] prompt: {prompt_clean[:240]}", "cyan"))
+        print(self._color(f"[LLM-PROBE] response: {response_clean[:120]}", "yellow"))
+
     def _llm_verify_finding(self, kind, value, confidence, source_type, reasons, context):
         cache_key = (kind, value, confidence, source_type)
         if cache_key in self._llm_cache:
@@ -644,9 +652,11 @@ class WebReconSpider(scrapy.Spider):
                     answer = str(msg.get("content", ""))
             verdict = self._llm_yes_no(answer)
             detail = answer.strip()[:32]
+            self._llm_probe_preview_print(probe_prompt, answer)
             self._llm_debug_print("probe", probe_prompt, answer)
         except (urllib_error.URLError, urllib_error.HTTPError, TimeoutError, ValueError, OSError) as exc:
             detail = str(exc).strip()[:120]
+            self._llm_probe_preview_print(probe_prompt, detail)
             self._llm_debug_print("probe", probe_prompt, detail)
 
         self.llm_probe_latency_ms = int((time.time() - probe_start) * 1000)
