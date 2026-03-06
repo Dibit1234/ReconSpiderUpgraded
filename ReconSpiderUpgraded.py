@@ -244,6 +244,8 @@ class WebReconSpider(scrapy.Spider):
         self.llm_relaxed = self._as_bool(llm_relaxed)
         self.llm_test = self._as_bool(llm_test)
         self.llm_enabled = bool(self.llm_endpoint)
+        # In LLM mode, only keep findings explicitly approved by the model.
+        self.llm_certified_only = self.llm_enabled
         self.llm_url = self._build_llm_url(self.llm_endpoint) if self.llm_enabled else ""
         self._llm_cache = {}
         self._llm_reject_enabled = True
@@ -438,6 +440,8 @@ class WebReconSpider(scrapy.Spider):
         if self.llm_max_checks > 0 and self.scan_stats["llm_checks"] >= self.llm_max_checks:
             self.scan_stats["llm_skipped_budget"] += 1
             return False
+        if self.llm_certified_only:
+            return True
         if self.llm_validate_all:
             return True
         if kind in {"api_key_candidates", "password_candidates", "usernames", "emails"}:
@@ -580,7 +584,7 @@ class WebReconSpider(scrapy.Spider):
             if self.EMAIL_RE.fullmatch(str(value or "")) and not self._is_placeholder_email(str(value or "")):
                 verdict = True
 
-        if verdict is False and self.scan_stats["llm_checks"] >= 12:
+        if (not self.llm_certified_only) and verdict is False and self.scan_stats["llm_checks"] >= 12:
             no_rate = self.scan_stats["llm_no"] / max(self.scan_stats["llm_checks"], 1)
             if no_rate >= 0.95 and self.scan_stats["llm_yes"] <= 1:
                 self._llm_reject_enabled = False
@@ -594,7 +598,9 @@ class WebReconSpider(scrapy.Spider):
                         )
                     )
 
-        if verdict is None:
+        if self.llm_certified_only:
+            allowed = verdict is True
+        elif verdict is None:
             allowed = True
         elif verdict is False and not self._llm_reject_enabled:
             allowed = True
@@ -898,11 +904,16 @@ class WebReconSpider(scrapy.Spider):
     def _record_finding(self, kind, value, confidence, url, source_type, context="", reasons=None):
         if not value:
             return
-        if self._llm_should_validate(kind, confidence):
+        should_validate = self._llm_should_validate(kind, confidence)
+        if should_validate:
             if not self._llm_verify_finding(kind, value, confidence, source_type, reasons, context):
                 if kind in self.results:
                     self.results[kind].discard(value)
                 return
+        elif self.llm_enabled and self.llm_certified_only:
+            if kind in self.results:
+                self.results[kind].discard(value)
+            return
         dedupe_key = (kind, value, url)
         if dedupe_key in self.finding_dedupe:
             return
@@ -1689,7 +1700,7 @@ def print_banner(
         print(
             f"LLM verify: enabled endpoint={llm} model={llm_model or '<required>'} "
             f"max_checks={llm_budget} scope={llm_scope} "
-            f"relaxed={bool(llm_relaxed)} test={bool(llm_test)}"
+            f"relaxed={bool(llm_relaxed)} test={bool(llm_test)} mode=certified_only"
         )
     else:
         print("LLM verify: disabled")
