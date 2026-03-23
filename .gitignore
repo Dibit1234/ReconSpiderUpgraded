@@ -15,5 +15,4 @@ build/
 # Runtime output files
 results.json
 findings.jsonl
-uvicorn*.log
 

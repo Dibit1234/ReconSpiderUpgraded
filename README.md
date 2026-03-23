@@ -1,13 +1,5 @@
 # ReconSpiderUpgraded
 
-## Workspace Projects
-
-This repository currently contains multiple local projects. The main addition in this workspace is:
-
-- `WfiAuditPlus/`: passive Wi-Fi audit console with real Windows Wi-Fi telemetry, device-centric radar view, passive AP inspection, and export utilities.
-
-See [WfiAuditPlus/README.md](WfiAuditPlus/README.md) for its setup and usage.
-
 ReconSpiderUpgraded is a Scrapy-based reconnaissance crawler focused on surfacing potentially sensitive data in client-visible content.
 
 It scans HTML pages, inline scripts, comments, query strings, and same-domain JS/CSS assets for:
