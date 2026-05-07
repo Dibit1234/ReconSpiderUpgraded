@@ -2007,6 +2007,7 @@ def print_banner(
     llm_relaxed=True,
     llm_test=False,
     include_urls=False,
+    include_external=False,
     comments_enabled=False,
     random_user_agent=False,
     user_agent="",
