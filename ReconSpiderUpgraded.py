@@ -134,9 +134,9 @@ class WebReconSpider(scrapy.Spider):
 
     API_CONTEXT_RE = re.compile(
         r"(?ix)"
-        r"\b(?P<key>api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|secret[_-]?key|bearer)\b"
+        r"\b(?P<key>api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|secret[_-]?key|bearer|apikey|api_key|api-token|auth_token|client_secret|secret_key)\b"
         r"\s*[:=]\s*"
-        r"[\"']?(?P<value>[A-Za-z0-9_\-./+=]{16,})[\"']?"
+        r"[\"']?(?P<value>[A-Za-z0-9_\-./+=]{16,100})[\"']?"
     )
 
     USERNAME_CONTEXT_RE = re.compile(
