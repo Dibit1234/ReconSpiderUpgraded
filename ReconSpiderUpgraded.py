@@ -1917,6 +1917,7 @@ def run_crawler(
         llm_relaxed=llm_relaxed,
         llm_test=llm_test,
         include_urls=include_urls,
+        comments_enabled=comments_enabled,
         random_user_agent=random_user_agent,
         user_agent=user_agent,
     )
@@ -1956,6 +1957,7 @@ def print_banner(
     llm_relaxed=True,
     llm_test=False,
     include_urls=False,
+    comments_enabled=False,
     random_user_agent=False,
     user_agent="",
 ):
