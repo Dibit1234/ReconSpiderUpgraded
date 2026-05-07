@@ -2,6 +2,7 @@ import argparse
 import ipaddress
 import json
 import math
+import random
 import re
 import shutil
 import signal
@@ -26,6 +27,33 @@ class CustomOffsiteMiddleware(OffsiteMiddleware):
             return True
         host = urlparse(request.url).netloc.split(":")[0]
         return bool(self.host_regex.search(host))
+
+
+class RandomUserAgentMiddleware:
+    COMMON_USER_AGENTS = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
+    ]
+
+    def __init__(self, user_agent=None, random_user_agent=False):
+        self.user_agent = user_agent
+        self.random_user_agent = random_user_agent
+
+    @classmethod
+    def from_crawler(cls, crawler):
+        return cls(
+            user_agent=crawler.settings.get("USER_AGENT_OVERRIDE", ""),
+            random_user_agent=crawler.settings.getbool("RANDOM_USER_AGENT", False),
+        )
+
+    def process_request(self, request, spider=None):
+        if self.random_user_agent:
+            request.headers["User-Agent"] = random.choice(self.COMMON_USER_AGENTS)
+        elif self.user_agent:
+            request.headers["User-Agent"] = self.user_agent
 
 
 class WebReconSpider(scrapy.Spider):
@@ -343,6 +371,7 @@ class WebReconSpider(scrapy.Spider):
             "private_key_markers": [],
         }
         self.finding_dedupe = set()
+        self.oversize_pages = []
 
         self.scan_stats = {
             "pages_scanned": 0,
@@ -1051,7 +1080,8 @@ class WebReconSpider(scrapy.Spider):
                 )
             print(
                 f"progress {pct * 100:6.2f}% pages={pages}/{self.max_pages} "
-                f"text={self.scan_stats['text_pages_scanned']} found={found_total}{llm_info}"
+                f"text={self.scan_stats['text_pages_scanned']} "
+                f"oversize={self.scan_stats['oversize_text_skipped']} found={found_total}{llm_info}"
             )
             return
 
@@ -1071,6 +1101,7 @@ class WebReconSpider(scrapy.Spider):
             f"{self._color(f'{pct * 100:6.2f}%', 'bold')} "
             f"{self._color(f'pages={pages}/{self.max_pages}', 'gray')} "
             f"text={self.scan_stats['text_pages_scanned']} "
+            f"oversize={self.scan_stats['oversize_text_skipped']} "
             f"{self._color(f'found={found_total}', 'green')} "
             f"ips={len(self.results['ip_addresses'])} "
             f"api={self._format_pair(len(self.results['api_keys']), len(self.results['api_key_candidates']))} "
@@ -1514,6 +1545,12 @@ class WebReconSpider(scrapy.Spider):
 
             if len(response.body) > self.max_text_bytes:
                 self.scan_stats["oversize_text_skipped"] += 1
+                self.oversize_pages.append(
+                    {
+                        "url": current_url,
+                        "size": len(response.body),
+                    }
+                )
             else:
                 self._extract_sensitive_data(response.text, response.url, "html")
 
@@ -1635,6 +1672,7 @@ class WebReconSpider(scrapy.Spider):
 
         normalized["findings"] = self.findings
         normalized["scan_stats"] = self.scan_stats
+        normalized["oversize_pages"] = self.oversize_pages
         normalized["scan_reason"] = reason
         normalized["target"] = self.start_urls[0]
         normalized["max_pages"] = self.max_pages
@@ -1694,14 +1732,20 @@ def run_crawler(
     llm_relaxed=True,
     llm_test=False,
     include_urls=False,
+    random_user_agent=False,
+    user_agent="",
 ):
     verbose = WebReconSpider._as_bool(verbose)
     stream_findings = WebReconSpider._as_bool(stream_findings)
+    random_user_agent = WebReconSpider._as_bool(random_user_agent)
 
     settings = {
         "DOWNLOADER_MIDDLEWARES": {
+            "__main__.RandomUserAgentMiddleware": 400,
             "__main__.CustomOffsiteMiddleware": 500,
         },
+        "USER_AGENT_OVERRIDE": user_agent or "",
+        "RANDOM_USER_AGENT": random_user_agent,
         "CLOSESPIDER_PAGECOUNT": max(1, int(max_pages)),
         "LOG_LEVEL": "INFO" if verbose else "WARNING",
         "LOGSTATS_INTERVAL": 0,
@@ -1748,6 +1792,8 @@ def run_crawler(
         llm_relaxed=llm_relaxed,
         llm_test=llm_test,
         include_urls=include_urls,
+        random_user_agent=random_user_agent,
+        user_agent=user_agent,
     )
     stop_requested = {"value": False}
 
@@ -1785,6 +1831,8 @@ def print_banner(
     llm_relaxed=True,
     llm_test=False,
     include_urls=False,
+    random_user_agent=False,
+    user_agent="",
 ):
     if not sys.stdout.isatty():
         return
@@ -1799,7 +1847,7 @@ def print_banner(
     print(banner)
     print(f"{APP_NAME} v{APP_VERSION} | Target: {start_url}")
     print(f"Max pages: {max_pages} | Max text bytes: {max_text_bytes} | Verbose: {verbose}")
-    print(f"Stream findings.jsonl: {stream_findings} | Include URLs: {include_urls}")
+    print(f"Stream findings.jsonl: {stream_findings} | Include URLs: {include_urls} | Random UA: {random_user_agent} | User-Agent: {user_agent or '<default>'}")
     if llm:
         llm_scope = "all_findings" if bool(llm_validate_all) else "candidates_only"
         llm_budget = "unlimited" if int(llm_max_checks) <= 0 else str(llm_max_checks)
@@ -1880,6 +1928,16 @@ if __name__ == "__main__":
         help="Include URLs/links section in output (excluded by default to reduce noise)",
     )
     parser.add_argument(
+        "--random-user-agent",
+        action="store_true",
+        help="Rotate common browser User-Agent headers to improve success against WAF/AV-protected sites.",
+    )
+    parser.add_argument(
+        "--user-agent",
+        default="",
+        help="Set a custom User-Agent header for all requests.",
+    )
+    parser.add_argument(
         "--test",
         action="store_true",
         help="LLM debug mode: print prompt snippets and raw LLM replies in CLI.",
@@ -1903,4 +1961,6 @@ if __name__ == "__main__":
         llm_relaxed=not args.no_llm_relaxed,
         llm_test=args.test,
         include_urls=args.include_urls,
+        random_user_agent=args.random_user_agent,
+        user_agent=args.user_agent,
     )
