@@ -92,11 +92,22 @@ class WebReconSpider(scrapy.Spider):
         "shopify_access_token": re.compile(r"\bshpat_[A-Fa-f0-9]{32}\b"),
         "digitalocean_pat": re.compile(r"\bdop_v1_[A-Za-z0-9]{40,}\b"),
         "mapbox_token": re.compile(r"\b(?:pk|sk)\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b"),
+        "hugging_face": re.compile(r"\bhf_[A-Za-z0-9_-]{20,}\b"),
+        "openai": re.compile(r"\bsk-(?:proj|org|sandbox)-[A-Za-z0-9_-]{20,}\b"),
+        "anthropic": re.compile(r"\bsk-ant-[A-Za-z0-9_-]{20,}\b"),
+        "groq": re.compile(r"\bgsk_[A-Za-z0-9_-]{20,}\b"),
+        "azure_sas": re.compile(r"\b(?:sv|se|sk|sr|sp|sig)=[A-Za-z0-9%_-]{10,}&(?:sv|se|sk|sr|sp|sig)=[A-Za-z0-9%_-]{10,}\b"),
+        "datadog": re.compile(r"\bDD[0-9A-Fa-f]{32}\b"),
+        "bugsnag": re.compile(r"\b[0-9a-fA-F]{32}\b"),  # Bugsnag API keys are 32 hex chars
+        "bugherd": re.compile(r"\b[A-Za-z0-9_-]{20,}\b"),  # BugHerd API keys
+        "mailgun": re.compile(r"\bkey-[A-Za-z0-9_-]{20,}\b"),
+        "sendinblue": re.compile(r"\bxkeysib-[A-Za-z0-9_-]{20,}\b"),
     }
 
     API_CONTEXT_RE = re.compile(
         r"(?ix)"
-        r"(?:api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|secret[_-]?key|bearer)"
+        r"(?:(?:api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|secret[_-]?key|bearer)"
+        r"|(?:^|[{;\s])api[_-]?key)"
         r"\s*[:=]\s*"
         r"[\"']?([A-Za-z0-9_\-./+=]{16,})[\"']?"
     )
@@ -107,12 +118,27 @@ class WebReconSpider(scrapy.Spider):
         r"\s*[:=]\s*"
         r"[\"']?([A-Za-z0-9._@\-]{3,64})[\"']?"
     )
+    USERNAME_PLAINTEXT_RE = re.compile(
+        r"(?i)\busername\s*:\s*([a-zA-Z0-9._@\-]{3,64})\b"
+    )
 
     PASSWORD_ASSIGNMENT_RE = re.compile(
         r"(?ix)"
         r"(?:password|passwd|pwd|passphrase|db_pass|db_password|secret)"
         r"\s*[:=]\s*"
         r"[\"']([^\"'\n\r]{4,128})[\"']"
+    )
+    PASSWORD_YAML_RE = re.compile(
+        r"(?ix)"
+        r"(?:password|passwd|pwd|passphrase|db_pass|db_password|secret)"
+        r"\s*:\s*"
+        r"[\"']?([^\"'\n\r]{4,128})[\"']?"
+    )
+    ENV_VAR_RE = re.compile(
+        r"(?i)export\s+([A-Z_]+)\s*=\s*[\"']?([^\"'\n\r]+)[\"']?"
+    )
+    DATABASE_URL_RE = re.compile(
+        r"(?i)(postgres|mysql|mongodb|sqlite)://([^:]+):([^@]+)@"
     )
     STRUCTURED_KV_RE = re.compile(
         r"(?ix)"
@@ -248,6 +274,7 @@ class WebReconSpider(scrapy.Spider):
         llm_validate_all=False,
         llm_relaxed=True,
         llm_test=False,
+        include_urls=False,
         *args,
         **kwargs,
     ):
@@ -266,6 +293,7 @@ class WebReconSpider(scrapy.Spider):
         self.llm_validate_all = self._as_bool(llm_validate_all)
         self.llm_relaxed = self._as_bool(llm_relaxed)
         self.llm_test = self._as_bool(llm_test)
+        self.include_urls = self._as_bool(include_urls)
         self.llm_enabled = bool(self.llm_endpoint)
         # In LLM mode, only keep findings explicitly approved by the model.
         self.llm_certified_only = self.llm_enabled
@@ -1153,27 +1181,35 @@ class WebReconSpider(scrapy.Spider):
                 )
 
     def _extract_usernames(self, text, source_url, source_type):
+        # Context-based assignments
         for username in self.USERNAME_CONTEXT_RE.findall(text):
-            cleaned = username.strip()
-            if cleaned.lower() in {"admin", "root", "user", "username", "login", "test"}:
-                continue
-            if self._is_placeholder(cleaned):
-                continue
-            if cleaned.lower() in self.USERNAME_STOPWORDS:
-                continue
-            if self._looks_like_asset_or_css_token(cleaned):
-                continue
-            self.results["usernames"].add(cleaned)
-            self.scan_stats["username_matches"] += 1
-            self._record_finding(
-                "usernames",
-                cleaned,
-                "medium",
-                source_url,
-                source_type,
-                self._snip_context(text, cleaned),
-                reasons=["username_context"],
-            )
+            self._process_username_candidate(username, text, source_url, source_type, "context_assignment")
+
+        # Plaintext in docs
+        for username in self.USERNAME_PLAINTEXT_RE.findall(text):
+            self._process_username_candidate(username, text, source_url, source_type, "plaintext")
+
+    def _process_username_candidate(self, username, text, source_url, source_type, reason):
+        cleaned = username.strip()
+        if cleaned.lower() in {"admin", "root", "user", "username", "login", "test"}:
+            return
+        if self._is_placeholder(cleaned):
+            return
+        if cleaned.lower() in self.USERNAME_STOPWORDS:
+            return
+        if self._looks_like_asset_or_css_token(cleaned):
+            return
+        self.results["usernames"].add(cleaned)
+        self.scan_stats["username_matches"] += 1
+        self._record_finding(
+            "usernames",
+            cleaned,
+            "medium",
+            source_url,
+            source_type,
+            self._snip_context(text, cleaned),
+            reasons=[reason],
+        )
 
     def _extract_passwords(self, text, source_url, source_type):
         surrounding_context = text.lower()
@@ -1181,33 +1217,51 @@ class WebReconSpider(scrapy.Spider):
             k in surrounding_context for k in self.CONTEXT_HINTS
         )
 
+        # Standard quoted assignments
         for value in self.PASSWORD_ASSIGNMENT_RE.findall(text):
-            candidate = unescape(value.strip())
-            if not candidate:
-                continue
-            if candidate.lower() in self.PASSWORD_PLACEHOLDERS:
-                continue
-            if self._is_placeholder(candidate):
-                continue
+            self._process_password_candidate(value, text, source_url, source_type, has_auth_context, "quoted_assignment")
 
-            score, reasons = self._password_score(candidate, key_hint="password", has_auth_context=has_auth_context)
+        # YAML-style unquoted
+        for value in self.PASSWORD_YAML_RE.findall(text):
+            self._process_password_candidate(value, text, source_url, source_type, has_auth_context, "yaml_style")
 
-            context = self._snip_context(text, candidate)
-            if score >= 4:
-                self.results["passwords"].add(candidate)
-                self.scan_stats["password_matches"] += 1
-                self._record_finding("passwords", candidate, "high", source_url, source_type, context, reasons)
-            else:
-                self.results["password_candidates"].add(candidate)
-                self._record_finding(
-                    "password_candidates",
-                    candidate,
-                    "low" if score < 3 else "medium",
-                    source_url,
-                    source_type,
-                    context,
-                    reasons,
-                )
+        # Environment variables
+        for key, value in self.ENV_VAR_RE.findall(text):
+            if any(pw_key in key.lower() for pw_key in self.PASSWORD_KEYS):
+                self._process_password_candidate(value, text, source_url, source_type, has_auth_context, f"env_var_{key}")
+
+        # Database URLs
+        for db_type, user, passwd in self.DATABASE_URL_RE.findall(text):
+            self._process_password_candidate(passwd, text, source_url, source_type, has_auth_context, f"db_url_{db_type}")
+
+    def _process_password_candidate(self, candidate, text, source_url, source_type, has_auth_context, reason_prefix):
+        candidate = unescape(candidate.strip())
+        if not candidate:
+            return
+        if candidate.lower() in self.PASSWORD_PLACEHOLDERS:
+            return
+        if self._is_placeholder(candidate):
+            return
+
+        score, reasons = self._password_score(candidate, key_hint="password", has_auth_context=has_auth_context)
+        reasons.append(reason_prefix)
+
+        context = self._snip_context(text, candidate)
+        if score >= 4:
+            self.results["passwords"].add(candidate)
+            self.scan_stats["password_matches"] += 1
+            self._record_finding("passwords", candidate, "high", source_url, source_type, context, reasons)
+        else:
+            self.results["password_candidates"].add(candidate)
+            self._record_finding(
+                "password_candidates",
+                candidate,
+                "low" if score < 3 else "medium",
+                source_url,
+                source_type,
+                context,
+                reasons,
+            )
 
     def _classify_structured_kv(self, key, value, source_url, source_type, raw_text):
         key_l = key.lower().strip()
@@ -1453,7 +1507,7 @@ class WebReconSpider(scrapy.Spider):
         self.visited_urls.add(current_url)
 
         content_type = response.headers.get("Content-Type", b"").decode("utf-8", errors="ignore").lower()
-        is_text = content_type.startswith("text") or "json" in content_type or "javascript" in content_type
+        is_text = content_type.startswith("text") or "json" in content_type or "javascript" in content_type or response.url.startswith("file://")
 
         if is_text:
             self.scan_stats["text_pages_scanned"] += 1
@@ -1550,6 +1604,8 @@ class WebReconSpider(scrapy.Spider):
 
         normalized = {}
         for key, values in self.results.items():
+            if key == "links" and not self.include_urls:
+                continue
             if key == "ip_addresses":
                 normalized[key] = self._record_private_ips_first(values)
             else:
@@ -1637,6 +1693,7 @@ def run_crawler(
     llm_validate_all=False,
     llm_relaxed=True,
     llm_test=False,
+    include_urls=False,
 ):
     verbose = WebReconSpider._as_bool(verbose)
     stream_findings = WebReconSpider._as_bool(stream_findings)
@@ -1676,6 +1733,7 @@ def run_crawler(
         llm_validate_all=llm_validate_all,
         llm_relaxed=llm_relaxed,
         llm_test=llm_test,
+        include_urls=include_urls,
     )
     print_banner(
         start_url,
@@ -1689,6 +1747,7 @@ def run_crawler(
         llm_validate_all=llm_validate_all,
         llm_relaxed=llm_relaxed,
         llm_test=llm_test,
+        include_urls=include_urls,
     )
     stop_requested = {"value": False}
 
@@ -1725,6 +1784,7 @@ def print_banner(
     llm_validate_all=False,
     llm_relaxed=True,
     llm_test=False,
+    include_urls=False,
 ):
     if not sys.stdout.isatty():
         return
@@ -1739,7 +1799,7 @@ def print_banner(
     print(banner)
     print(f"{APP_NAME} v{APP_VERSION} | Target: {start_url}")
     print(f"Max pages: {max_pages} | Max text bytes: {max_text_bytes} | Verbose: {verbose}")
-    print(f"Stream findings.jsonl: {stream_findings}")
+    print(f"Stream findings.jsonl: {stream_findings} | Include URLs: {include_urls}")
     if llm:
         llm_scope = "all_findings" if bool(llm_validate_all) else "candidates_only"
         llm_budget = "unlimited" if int(llm_max_checks) <= 0 else str(llm_max_checks)
@@ -1815,6 +1875,11 @@ if __name__ == "__main__":
         help="Disable relaxed candidate collection when LLM is enabled.",
     )
     parser.add_argument(
+        "--include-urls",
+        action="store_true",
+        help="Include URLs/links section in output (excluded by default to reduce noise)",
+    )
+    parser.add_argument(
         "--test",
         action="store_true",
         help="LLM debug mode: print prompt snippets and raw LLM replies in CLI.",
@@ -1837,4 +1902,5 @@ if __name__ == "__main__":
         llm_validate_all=args.llm_validate_all,
         llm_relaxed=not args.no_llm_relaxed,
         llm_test=args.test,
+        include_urls=args.include_urls,
     )
