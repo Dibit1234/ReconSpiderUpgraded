@@ -134,10 +134,9 @@ class WebReconSpider(scrapy.Spider):
 
     API_CONTEXT_RE = re.compile(
         r"(?ix)"
-        r"(?:(?:api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|secret[_-]?key|bearer)"
-        r"|(?:^|[{;\s])api[_-]?key)"
+        r"\b(?P<key>api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|secret[_-]?key|bearer)\b"
         r"\s*[:=]\s*"
-        r"[\"']?([A-Za-z0-9_\-./+=]{16,})[\"']?"
+        r"[\"']?(?P<value>[A-Za-z0-9_\-./+=]{16,})[\"']?"
     )
 
     USERNAME_CONTEXT_RE = re.compile(
@@ -262,29 +261,115 @@ class WebReconSpider(scrapy.Spider):
     }
 
     TRACKING_QUERY_KEYS = {
+        # Analytics & Marketing
         "utm_source",
         "utm_medium",
         "utm_campaign",
         "utm_term",
         "utm_content",
+        "utm_id",
+        "utm_source_platform",
         "_ga",
         "_gl",
         "gclid",
         "fbclid",
         "mc_cid",
         "mc_eid",
+        "msclkid",
+        "wickedid",
+        "twclid",
+        "ttclid",
+        "gbraid",
+        "wbraid",
+        # Pagination & Sorting (create URL variations without new content)
+        "page",
+        "paged",
+        "offset",
+        "limit",
+        "sort",
+        "order",
+        "orderby",
+        "per_page",
+        "per-page",
+        # Filtering (often creates duplicate content variations)
+        "filter",
+        "category",
+        "cat",
+        "tag",
+        "author",
+        "s",
+        "q",
+        "search",
+        "keyword",
+        # Session & Navigation
+        "ref",
+        "referer",
+        "return",
+        "redirect",
+        "back",
+        "cid",
+        "sid",
+        "v",
+        "tab",
+        "view",
     }
 
     SKIP_PATH_PATTERNS = [
         re.compile(p, re.IGNORECASE)
         for p in [
+            # Authentication & Admin
             r"/logout/?$",
             r"/signout/?$",
+            r"/login/?$",
+            r"/signin/?$",
+            r"/sign_out/?$",
+            r"/sign_in/?$",
             r"/wp-login\.php$",
             r"/wp-admin/",
+            r"/admin/?$",
+            r"/administrator/",
+            r"/adm/",
+            # User accounts
+            r"/profile/?$",
+            r"/settings/?$",
+            r"/account/?$",
+            r"/user/?$",
+            r"/profile/",
+            r"/settings/",
+            r"/account/",
+            # E-commerce cart/checkout
             r"/cart/?$",
             r"/checkout/?$",
+            r"/order/?$",
+            r"/invoice/?$",
+            r"/basket/?$",
+            # Content feeds & comments
             r"/calendar/",
+            r"/feed/?$",
+            r"/feeds/?$",
+            r"/rss/?$",
+            r"/comments/?$",
+            r"/comment/",
+            r"/review/?$",
+            r"/reviews/?$",
+            r"/rating/?$",
+            r"/ratings/?$",
+            # Media & static assets are usually skipped separately, but catch these
+            r"/media/",
+            r"/uploads/",
+            r"/files/",
+            # Search (creates many unique URLs with no new content)
+            r"/search/?$",
+            r"/search/",
+            r"/find/?$",
+            # API endpoints that often spam with many similar paths
+            r"/api/v\d+/",
+            # Print & export (usually duplicates)
+            r"/print/?$",
+            r"/pdf/?$",
+            r"/export/?$",
+            # Sitemap (not useful for reconnaissance)
+            r"/sitemap",
         ]
     ]
 
@@ -303,6 +388,7 @@ class WebReconSpider(scrapy.Spider):
         llm_relaxed=True,
         llm_test=False,
         include_urls=False,
+        comments_enabled=False,
         *args,
         **kwargs,
     ):
@@ -322,6 +408,7 @@ class WebReconSpider(scrapy.Spider):
         self.llm_relaxed = self._as_bool(llm_relaxed)
         self.llm_test = self._as_bool(llm_test)
         self.include_urls = self._as_bool(include_urls)
+        self.comments_enabled = self._as_bool(comments_enabled)
         self.llm_enabled = bool(self.llm_endpoint)
         # In LLM mode, only keep findings explicitly approved by the model.
         self.llm_certified_only = self.llm_enabled
@@ -996,17 +1083,44 @@ class WebReconSpider(scrapy.Spider):
         path = parsed.path or "/"
         query = (parsed.query or "").lower()
 
+        # Skip session/tracking parameters
         if "replytocom=" in query:
             return True
         if "sessionid=" in query or "phpsessid=" in query:
             return True
+        
+        # Skip if too many query parameters (likely pagination/filtering spam)
+        if query and len(query.split("&")) > 5:
+            return True
+
+        # Skip file extensions that are rarely useful for reconnaissance
+        path_lower = path.lower()
+        skip_extensions = (
+            ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg",  # Images
+            ".mp4", ".webm", ".mp3", ".wav", ".m4a",  # Media
+            ".pdf", ".doc", ".docx", ".xls", ".xlsx",  # Documents
+            ".zip", ".tar", ".gz", ".rar",  # Archives
+            ".exe", ".dll", ".so", ".dylib",  # Binaries
+            ".css", ".scss", ".less",  # Stylesheets
+        )
+        if any(path_lower.endswith(ext) for ext in skip_extensions):
+            return True
+
+        # Skip numeric IDs that create many similar URLs (pagination spam)
+        # e.g., /product/12345, /item/999, /article/555
+        path_parts = path.rstrip("/").split("/")
+        if len(path_parts) >= 2:
+            last_part = path_parts[-1]
+            if last_part.isdigit() and len(last_part) > 3:
+                # Likely a numeric ID - these create massive URL counts
+                return True
 
         for pattern in self.SKIP_PATH_PATTERNS:
             if pattern.search(path):
                 return True
         return False
 
-    def _record_finding(self, kind, value, confidence, url, source_type, context="", reasons=None):
+    def _record_finding(self, kind, value, confidence, url, source_type, context="", reasons=None, assignment=None):
         if not value:
             return
         should_validate = self._llm_should_validate(kind, confidence)
@@ -1034,6 +1148,8 @@ class WebReconSpider(scrapy.Spider):
             finding["context"] = context
         if reasons:
             finding["reasons"] = reasons
+        if assignment:
+            finding["assignment"] = assignment
         self.findings[kind].append(finding)
 
         if confidence == "high":
@@ -1165,7 +1281,7 @@ class WebReconSpider(scrapy.Spider):
                     reasons=["provider_signature"],
                 )
 
-        for match in self.API_CONTEXT_RE.findall(text):
+        for key, match in self.API_CONTEXT_RE.findall(text):
             candidate = match.strip()
             min_len = 10 if (self.llm_enabled and self.llm_relaxed) else 16
             if len(candidate) < min_len or self._is_placeholder(candidate):
@@ -1173,6 +1289,7 @@ class WebReconSpider(scrapy.Spider):
             if self._looks_like_asset_or_css_token(candidate):
                 continue
             score, entropy = self._api_candidate_score(candidate)
+            assignment = f"{key}={candidate}"
             if candidate.isalpha() or score < 2:
                 if not self.llm_enabled or not self.llm_relaxed or score < 1:
                     continue
@@ -1184,7 +1301,8 @@ class WebReconSpider(scrapy.Spider):
                     source_url,
                     source_type,
                     self._snip_context(text, candidate),
-                    reasons=[f"context_assignment_relaxed", f"entropy={entropy:.2f}"],
+                    reasons=["context_assignment_relaxed", f"entropy={entropy:.2f}", f"token_key={key}"],
+                    assignment=assignment,
                 )
                 continue
             if score >= 3:
@@ -1197,7 +1315,8 @@ class WebReconSpider(scrapy.Spider):
                     source_url,
                     source_type,
                     self._snip_context(text, candidate),
-                    reasons=[f"context_assignment", f"entropy={entropy:.2f}"],
+                    reasons=["context_assignment", f"entropy={entropy:.2f}", f"token_key={key}"],
+                    assignment=assignment,
                 )
             else:
                 self.results["api_key_candidates"].add(candidate)
@@ -1208,7 +1327,8 @@ class WebReconSpider(scrapy.Spider):
                     source_url,
                     source_type,
                     self._snip_context(text, candidate),
-                    reasons=[f"context_assignment", f"entropy={entropy:.2f}"],
+                    reasons=["context_assignment", f"entropy={entropy:.2f}", f"token_key={key}"],
+                    assignment=assignment,
                 )
 
     def _extract_usernames(self, text, source_url, source_type):
@@ -1319,16 +1439,17 @@ class WebReconSpider(scrapy.Spider):
         if any(k in key_l for k in self.TOKEN_KEYS):
             score, entropy = self._api_candidate_score(value)
             reasons = [f"token_key={key_l}", f"entropy={entropy:.2f}"]
+            assignment = f"{key}={value}"
             if score >= 3:
                 self.results["api_keys"].add(value)
                 self.scan_stats["api_matches"] += 1
-                self._record_finding("api_keys", value, "high", source_url, source_type, context, reasons)
+                self._record_finding("api_keys", value, "high", source_url, source_type, context, reasons, assignment=assignment)
             elif score >= 2:
                 self.results["api_key_candidates"].add(value)
-                self._record_finding("api_key_candidates", value, "medium", source_url, source_type, context, reasons)
+                self._record_finding("api_key_candidates", value, "medium", source_url, source_type, context, reasons, assignment=assignment)
             elif self.llm_enabled and self.llm_relaxed and score >= 1:
                 self.results["api_key_candidates"].add(value)
-                self._record_finding("api_key_candidates", value, "low", source_url, source_type, context, reasons)
+                self._record_finding("api_key_candidates", value, "low", source_url, source_type, context, reasons, assignment=assignment)
             return
 
         if any(k in key_l for k in self.USERNAME_KEYS):
@@ -1356,6 +1477,8 @@ class WebReconSpider(scrapy.Spider):
             return
         if self._is_likely_library_asset(source_url, source_type):
             return
+        if not self.llm_enabled:
+            return
         for token in self.GENERIC_SECRET_TOKEN_RE.findall(text):
             if len(token) < 24 or len(token) > 180:
                 continue
@@ -1376,14 +1499,13 @@ class WebReconSpider(scrapy.Spider):
                     any(c in "-_./+=" for c in token),
                 ]
             )
-            entropy_threshold = 3.8 if (self.llm_enabled and self.llm_relaxed) else 4.35
-            class_threshold = 2 if (self.llm_enabled and self.llm_relaxed) else 3
+            entropy_threshold = 3.8 if self.llm_relaxed else 4.35
+            class_threshold = 2 if self.llm_relaxed else 3
             if entropy < entropy_threshold or classes < class_threshold:
                 continue
-            if len(token) < 28 and not self.llm_enabled:
+            if len(token) < 28:
                 continue
             self.scan_stats["entropy_secret_hits"] += 1
-            # Keep generic entropy hits out of top-level candidate list to reduce noisy false positives.
             self._record_finding(
                 "api_key_candidates",
                 token,
@@ -1476,16 +1598,17 @@ class WebReconSpider(scrapy.Spider):
                         continue
                     score, entropy = self._api_candidate_score(candidate)
                     reasons = [f"query_key={k}", f"entropy={entropy:.2f}"]
+                    assignment = f"{k}={candidate}"
                     if score >= 3:
                         self.results["api_keys"].add(candidate)
                         self.scan_stats["api_matches"] += 1
-                        self._record_finding("api_keys", candidate, "high", url, "query", reasons=reasons)
+                        self._record_finding("api_keys", candidate, "high", url, "query", reasons=reasons, assignment=assignment)
                     elif score >= 2:
                         self.results["api_key_candidates"].add(candidate)
-                        self._record_finding("api_key_candidates", candidate, "medium", url, "query", reasons=reasons)
+                        self._record_finding("api_key_candidates", candidate, "medium", url, "query", reasons=reasons, assignment=assignment)
                     elif self.llm_enabled and self.llm_relaxed and score >= 1:
                         self.results["api_key_candidates"].add(candidate)
-                        self._record_finding("api_key_candidates", candidate, "low", url, "query", reasons=reasons)
+                        self._record_finding("api_key_candidates", candidate, "low", url, "query", reasons=reasons, assignment=assignment)
                 if any(t in k for t in ["user", "login", "account", "email"]):
                     if len(candidate) <= 128:
                         if candidate.lower() in self.USERNAME_STOPWORDS:
@@ -1554,10 +1677,11 @@ class WebReconSpider(scrapy.Spider):
             else:
                 self._extract_sensitive_data(response.text, response.url, "html")
 
-                comments = response.xpath("//comment()").getall()
-                self.results["comments"].update(comments)
-                for comment in comments:
-                    self._extract_sensitive_data(comment, response.url, "comment")
+                if self.comments_enabled:
+                    comments = response.xpath("//comment()").getall()
+                    self.results["comments"].update(comments)
+                    for comment in comments:
+                        self._extract_sensitive_data(comment, response.url, "comment")
 
                 inline_scripts = response.css("script::text").getall()
                 for script in inline_scripts:
@@ -1732,6 +1856,7 @@ def run_crawler(
     llm_relaxed=True,
     llm_test=False,
     include_urls=False,
+    comments_enabled=False,
     random_user_agent=False,
     user_agent="",
 ):
@@ -1847,7 +1972,7 @@ def print_banner(
     print(banner)
     print(f"{APP_NAME} v{APP_VERSION} | Target: {start_url}")
     print(f"Max pages: {max_pages} | Max text bytes: {max_text_bytes} | Verbose: {verbose}")
-    print(f"Stream findings.jsonl: {stream_findings} | Include URLs: {include_urls} | Random UA: {random_user_agent} | User-Agent: {user_agent or '<default>'}")
+    print(f"Stream findings.jsonl: {stream_findings} | Include URLs: {include_urls} | Include Comments: {comments_enabled} | Random UA: {random_user_agent} | User-Agent: {user_agent or '<default>'}")
     if llm:
         llm_scope = "all_findings" if bool(llm_validate_all) else "candidates_only"
         llm_budget = "unlimited" if int(llm_max_checks) <= 0 else str(llm_max_checks)
@@ -1928,6 +2053,11 @@ if __name__ == "__main__":
         help="Include URLs/links section in output (excluded by default to reduce noise)",
     )
     parser.add_argument(
+        "--include-comments",
+        action="store_true",
+        help="Include HTML comment scanning and comment findings in the results.",
+    )
+    parser.add_argument(
         "--random-user-agent",
         action="store_true",
         help="Rotate common browser User-Agent headers to improve success against WAF/AV-protected sites.",
@@ -1961,6 +2091,7 @@ if __name__ == "__main__":
         llm_relaxed=not args.no_llm_relaxed,
         llm_test=args.test,
         include_urls=args.include_urls,
+        comments_enabled=args.include_comments,
         random_user_agent=args.random_user_agent,
         user_agent=args.user_agent,
     )
