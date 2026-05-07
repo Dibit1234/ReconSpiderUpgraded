@@ -194,6 +194,24 @@ class WebReconSpider(scrapy.Spider):
         "client_secret",
         "bearer",
     }
+    GENERIC_TOKEN_KEYS = {"token", "secret", "bearer"}
+    STRONG_TOKEN_KEYS = {
+        "api_key",
+        "apikey",
+        "api-token",
+        "access_token",
+        "auth_token",
+        "client_secret",
+        "secret_key",
+    }
+    VERBOSE_FINDING_KINDS = {
+        "emails",
+        "usernames",
+        "passwords",
+        "password_candidates",
+        "api_keys",
+        "api_key_candidates",
+    }
     PLACEHOLDER_VALUES = {
         "null",
         "none",
@@ -388,6 +406,7 @@ class WebReconSpider(scrapy.Spider):
         llm_relaxed=True,
         llm_test=False,
         include_urls=False,
+        include_external=False,
         comments_enabled=False,
         *args,
         **kwargs,
@@ -408,6 +427,7 @@ class WebReconSpider(scrapy.Spider):
         self.llm_relaxed = self._as_bool(llm_relaxed)
         self.llm_test = self._as_bool(llm_test)
         self.include_urls = self._as_bool(include_urls)
+        self.include_external = self._as_bool(include_external)
         self.comments_enabled = self._as_bool(comments_enabled)
         self.llm_enabled = bool(self.llm_endpoint)
         # In LLM mode, only keep findings explicitly approved by the model.
@@ -967,6 +987,18 @@ class WebReconSpider(scrapy.Spider):
         return False
 
     @staticmethod
+    def _looks_like_hex_hash(value):
+        if len(value) < 20 or len(value) > 128:
+            return False
+        return bool(re.fullmatch(r"[0-9a-fA-F]+", value))
+
+    def _is_api_query_key(self, key):
+        key_l = key.lower()
+        if key_l in self.TOKEN_KEYS:
+            return True
+        return bool(re.search(r"(^|[_\-.])(?:api|token|auth|bearer)([_\-.]|$)", key_l))
+
+    @staticmethod
     def _is_likely_library_asset(source_url, source_type):
         if source_type not in {"js", "css"}:
             return False
@@ -1144,12 +1176,13 @@ class WebReconSpider(scrapy.Spider):
             "url": url,
             "source": source_type,
         }
-        if context:
-            finding["context"] = context
-        if reasons:
-            finding["reasons"] = reasons
-        if assignment:
-            finding["assignment"] = assignment
+        if kind in self.VERBOSE_FINDING_KINDS:
+            if context:
+                finding["context"] = context
+            if reasons:
+                finding["reasons"] = reasons
+            if assignment:
+                finding["assignment"] = assignment
         self.findings[kind].append(finding)
 
         if confidence == "high":
@@ -1437,9 +1470,20 @@ class WebReconSpider(scrapy.Spider):
             return
 
         if any(k in key_l for k in self.TOKEN_KEYS):
+            if self._looks_like_hex_hash(value):
+                return
             score, entropy = self._api_candidate_score(value)
             reasons = [f"token_key={key_l}", f"entropy={entropy:.2f}"]
             assignment = f"{key}={value}"
+            if key_l in self.GENERIC_TOKEN_KEYS:
+                if score >= 3:
+                    self.results["api_keys"].add(value)
+                    self.scan_stats["api_matches"] += 1
+                    self._record_finding("api_keys", value, "high", source_url, source_type, context, reasons, assignment=assignment)
+                elif score >= 3 and self.llm_enabled and self.llm_relaxed:
+                    self.results["api_key_candidates"].add(value)
+                    self._record_finding("api_key_candidates", value, "medium", source_url, source_type, context, reasons, assignment=assignment)
+                return
             if score >= 3:
                 self.results["api_keys"].add(value)
                 self.scan_stats["api_matches"] += 1
@@ -1593,8 +1637,10 @@ class WebReconSpider(scrapy.Spider):
                     else:
                         self.results["password_candidates"].add(candidate)
                         self._record_finding("password_candidates", candidate, "medium", url, "query", reasons=reasons)
-                if any(t in k for t in ["api", "token", "key", "auth", "bearer"]):
+                if self._is_api_query_key(k):
                     if self._looks_like_asset_or_css_token(candidate):
+                        continue
+                    if self._looks_like_hex_hash(candidate):
                         continue
                     score, entropy = self._api_candidate_score(candidate)
                     reasons = [f"query_key={k}", f"entropy={entropy:.2f}"]
@@ -1603,12 +1649,9 @@ class WebReconSpider(scrapy.Spider):
                         self.results["api_keys"].add(candidate)
                         self.scan_stats["api_matches"] += 1
                         self._record_finding("api_keys", candidate, "high", url, "query", reasons=reasons, assignment=assignment)
-                    elif score >= 2:
+                    elif score >= 2 and (k in self.STRONG_TOKEN_KEYS or (self.llm_enabled and self.llm_relaxed)):
                         self.results["api_key_candidates"].add(candidate)
                         self._record_finding("api_key_candidates", candidate, "medium", url, "query", reasons=reasons, assignment=assignment)
-                    elif self.llm_enabled and self.llm_relaxed and score >= 1:
-                        self.results["api_key_candidates"].add(candidate)
-                        self._record_finding("api_key_candidates", candidate, "low", url, "query", reasons=reasons, assignment=assignment)
                 if any(t in k for t in ["user", "login", "account", "email"]):
                     if len(candidate) <= 128:
                         if candidate.lower() in self.USERNAME_STOPWORDS:
@@ -1711,10 +1754,11 @@ class WebReconSpider(scrapy.Spider):
 
                     self.results["links"].add(normalized)
 
-                external_files = response.css("link::attr(href), a::attr(href)").re(r".*\.(?:css|pdf|docx?|xlsx?)$")
-                for ext_file in external_files:
-                    absolute_ext = self._normalize_url(response.urljoin(ext_file))
-                    self.results["external_files"].add(absolute_ext)
+                if self.include_external:
+                    external_files = response.css("link::attr(href), a::attr(href)").re(r".*\.(?:css|pdf|docx?|xlsx?)$")
+                    for ext_file in external_files:
+                        absolute_ext = self._normalize_url(response.urljoin(ext_file))
+                        self.results["external_files"].add(absolute_ext)
 
                 css_files = response.css("link[rel*=stylesheet]::attr(href)").getall()
                 for css_href in css_files:
@@ -1745,7 +1789,8 @@ class WebReconSpider(scrapy.Spider):
                 for aud in audio:
                     self.results["audio"].add(self._normalize_url(response.urljoin(aud)))
         else:
-            self.results["external_files"].add(response.url)
+            if self.include_external:
+                self.results["external_files"].add(response.url)
 
         if self.verbose:
             self.logger.info(
@@ -1766,6 +1811,8 @@ class WebReconSpider(scrapy.Spider):
         normalized = {}
         for key, values in self.results.items():
             if key == "links" and not self.include_urls:
+                continue
+            if key == "external_files" and not self.include_external:
                 continue
             if key == "ip_addresses":
                 normalized[key] = self._record_private_ips_first(values)
@@ -1856,6 +1903,7 @@ def run_crawler(
     llm_relaxed=True,
     llm_test=False,
     include_urls=False,
+    include_external=False,
     comments_enabled=False,
     random_user_agent=False,
     user_agent="",
@@ -1903,6 +1951,7 @@ def run_crawler(
         llm_relaxed=llm_relaxed,
         llm_test=llm_test,
         include_urls=include_urls,
+        include_external=include_external,
     )
     print_banner(
         start_url,
@@ -1917,6 +1966,7 @@ def run_crawler(
         llm_relaxed=llm_relaxed,
         llm_test=llm_test,
         include_urls=include_urls,
+        include_external=include_external,
         comments_enabled=comments_enabled,
         random_user_agent=random_user_agent,
         user_agent=user_agent,
@@ -1974,7 +2024,7 @@ def print_banner(
     print(banner)
     print(f"{APP_NAME} v{APP_VERSION} | Target: {start_url}")
     print(f"Max pages: {max_pages} | Max text bytes: {max_text_bytes} | Verbose: {verbose}")
-    print(f"Stream findings.jsonl: {stream_findings} | Include URLs: {include_urls} | Include Comments: {comments_enabled} | Random UA: {random_user_agent} | User-Agent: {user_agent or '<default>'}")
+    print(f"Stream findings.jsonl: {stream_findings} | Include URLs: {include_urls} | Include External: {include_external} | Include Comments: {comments_enabled} | Random UA: {random_user_agent} | User-Agent: {user_agent or '<default>'}")
     if llm:
         llm_scope = "all_findings" if bool(llm_validate_all) else "candidates_only"
         llm_budget = "unlimited" if int(llm_max_checks) <= 0 else str(llm_max_checks)
@@ -2060,6 +2110,11 @@ if __name__ == "__main__":
         help="Include HTML comment scanning and comment findings in the results.",
     )
     parser.add_argument(
+        "--include-external",
+        action="store_true",
+        help="Include external asset references such as CSS, PDF, DOCX and XLSX files in the output.",
+    )
+    parser.add_argument(
         "--random-user-agent",
         action="store_true",
         help="Rotate common browser User-Agent headers to improve success against WAF/AV-protected sites.",
@@ -2093,6 +2148,7 @@ if __name__ == "__main__":
         llm_relaxed=not args.no_llm_relaxed,
         llm_test=args.test,
         include_urls=args.include_urls,
+        include_external=args.include_external,
         comments_enabled=args.include_comments,
         random_user_agent=args.random_user_agent,
         user_agent=args.user_agent,
