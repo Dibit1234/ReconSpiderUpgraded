@@ -1178,7 +1178,7 @@ class WebReconSpider(scrapy.Spider):
             if kind in self.results:
                 self.results[kind].discard(value)
             return
-        dedupe_key = (kind, value, url)
+        dedupe_key = (kind, value)
         if dedupe_key in self.finding_dedupe:
             return
         self.finding_dedupe.add(dedupe_key)
@@ -1523,6 +1523,8 @@ class WebReconSpider(scrapy.Spider):
             return
 
         if any(k in key_l for k in self.TOKEN_KEYS):
+            if self._looks_like_text_phrase(value):
+                return
             if self._looks_like_hex_hash(value):
                 return
             score, entropy = self._api_candidate_score(value)
@@ -1692,6 +1694,8 @@ class WebReconSpider(scrapy.Spider):
                         self._record_finding("password_candidates", candidate, "medium", url, "query", reasons=reasons)
                 if self._is_api_query_key(k):
                     if self._looks_like_asset_or_css_token(candidate):
+                        continue
+                    if self._looks_like_text_phrase(candidate):
                         continue
                     if self._looks_like_hex_hash(candidate):
                         continue
