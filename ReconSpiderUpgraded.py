@@ -121,13 +121,11 @@ class WebReconSpider(scrapy.Spider):
         "digitalocean_pat": re.compile(r"\bdop_v1_[A-Za-z0-9]{40,}\b"),
         "mapbox_token": re.compile(r"\b(?:pk|sk)\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b"),
         "hugging_face": re.compile(r"\bhf_[A-Za-z0-9_-]{20,}\b"),
-        "openai": re.compile(r"\bsk-(?:proj|org|sandbox)-[A-Za-z0-9_-]{20,}\b"),
+        "openai": re.compile(r"\bsk-(?:proj|org|sandbox|live|test)?[A-Za-z0-9_-]{20,}\b"),
         "anthropic": re.compile(r"\bsk-ant-[A-Za-z0-9_-]{20,}\b"),
         "groq": re.compile(r"\bgsk_[A-Za-z0-9_-]{20,}\b"),
         "azure_sas": re.compile(r"\b(?:sv|se|sk|sr|sp|sig)=[A-Za-z0-9%_-]{10,}&(?:sv|se|sk|sr|sp|sig)=[A-Za-z0-9%_-]{10,}\b"),
         "datadog": re.compile(r"\bDD[0-9A-Fa-f]{32}\b"),
-        "bugsnag": re.compile(r"\b[0-9a-fA-F]{32}\b"),  # Bugsnag API keys are 32 hex chars
-        "bugherd": re.compile(r"\b[A-Za-z0-9_-]{20,}\b"),  # BugHerd API keys
         "mailgun": re.compile(r"\bkey-[A-Za-z0-9_-]{20,}\b"),
         "sendinblue": re.compile(r"\bxkeysib-[A-Za-z0-9_-]{20,}\b"),
     }
@@ -137,6 +135,16 @@ class WebReconSpider(scrapy.Spider):
         r"\b(?P<key>api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|secret[_-]?key|bearer|apikey|api_key|api-token|auth_token|client_secret|secret_key)\b"
         r"\s*[:=]\s*"
         r"[\"']?(?P<value>[A-Za-z0-9_\-./+=]{16,100})[\"']?"
+    )
+
+    API_HINTED_VALUE_RE = re.compile(
+        r"(?ix)"
+        r"(?P<field>\b(?:name|id|class|placeholder|title|aria-label|content|value|default|data[-_]?(?:api|token|secret|key|value))\b)"
+        r"\s*=\s*[\"'](?P<value>[A-Za-z0-9_\-./+=]{16,100})[\"']"
+    )
+
+    API_KEY_HINTS_RE = re.compile(
+        r"(?ix)\b(?:api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|secret[_-]?key|bearer|apikey|api_key|api-token|auth_token|client_secret|secret_key|token|secret|key|auth)\b"
     )
 
     USERNAME_CONTEXT_RE = re.compile(
@@ -208,9 +216,7 @@ class WebReconSpider(scrapy.Spider):
         "emails",
         "usernames",
         "passwords",
-        "password_candidates",
         "api_keys",
-        "api_key_candidates",
     }
     PLACEHOLDER_VALUES = {
         "null",
@@ -407,6 +413,7 @@ class WebReconSpider(scrapy.Spider):
         llm_test=False,
         include_urls=False,
         include_external=False,
+        signature_api_keys=True,
         comments_enabled=False,
         *args,
         **kwargs,
@@ -428,6 +435,7 @@ class WebReconSpider(scrapy.Spider):
         self.llm_test = self._as_bool(llm_test)
         self.include_urls = self._as_bool(include_urls)
         self.include_external = self._as_bool(include_external)
+        self.signature_api_keys = self._as_bool(signature_api_keys)
         self.comments_enabled = self._as_bool(comments_enabled)
         self.llm_enabled = bool(self.llm_endpoint)
         # In LLM mode, only keep findings explicitly approved by the model.
@@ -1037,6 +1045,11 @@ class WebReconSpider(scrapy.Spider):
             score += 1
         return score, entropy
 
+    def _is_api_hint_context(self, text_segment, attr_name=""):
+        if self.API_KEY_HINTS_RE.search(attr_name or ""):
+            return True
+        return bool(self.API_KEY_HINTS_RE.search(text_segment or ""))
+
     def _password_score(self, value, key_hint="", has_auth_context=False):
         score = 0
         reasons = []
@@ -1300,18 +1313,58 @@ class WebReconSpider(scrapy.Spider):
             )
 
     def _extract_api_keys(self, text, source_url, source_type):
-        for pattern in self.API_PATTERNS.values():
-            for match in pattern.findall(text):
-                self.results["api_keys"].add(match)
+        if self.signature_api_keys:
+            for pattern in self.API_PATTERNS.values():
+                for match in pattern.findall(text):
+                    self.results["api_keys"].add(match)
+                    self.scan_stats["api_matches"] += 1
+                    self._record_finding(
+                        "api_keys",
+                        match,
+                        "high",
+                        source_url,
+                        source_type,
+                        self._snip_context(text, match),
+                        reasons=["provider_signature"],
+                    )
+
+        for match in self.API_HINTED_VALUE_RE.finditer(text):
+            candidate = match.group("value").strip()
+            if len(candidate) < 16 or self._is_placeholder(candidate):
+                continue
+            if self._looks_like_asset_or_css_token(candidate):
+                continue
+            surrounding = text[max(0, match.start() - 120) : match.start()]
+            if not self._is_api_hint_context(surrounding, match.group("field")):
+                continue
+            score, entropy = self._api_candidate_score(candidate)
+            if score < 2:
+                continue
+            assignment = f"{match.group('field')}={candidate}"
+            if score >= 3:
+                self.results["api_keys"].add(candidate)
                 self.scan_stats["api_matches"] += 1
                 self._record_finding(
                     "api_keys",
-                    match,
+                    candidate,
                     "high",
                     source_url,
                     source_type,
-                    self._snip_context(text, match),
-                    reasons=["provider_signature"],
+                    self._snip_context(text, candidate),
+                    reasons=["hinted_value_assignment", f"entropy={entropy:.2f}", f"field={match.group('field')}"],
+                    assignment=assignment,
+                )
+            else:
+                self.results["api_key_candidates"].add(candidate)
+                self._record_finding(
+                    "api_key_candidates",
+                    candidate,
+                    "medium",
+                    source_url,
+                    source_type,
+                    self._snip_context(text, candidate),
+                    reasons=["hinted_value_assignment", f"entropy={entropy:.2f}", f"field={match.group('field')}"],
+                    assignment=assignment,
                 )
 
         for key, match in self.API_CONTEXT_RE.findall(text):
@@ -1904,6 +1957,7 @@ def run_crawler(
     llm_test=False,
     include_urls=False,
     include_external=False,
+    signature_api_keys=True,
     comments_enabled=False,
     random_user_agent=False,
     user_agent="",
@@ -1952,6 +2006,7 @@ def run_crawler(
         llm_test=llm_test,
         include_urls=include_urls,
         include_external=include_external,
+        signature_api_keys=signature_api_keys,
     )
     print_banner(
         start_url,
@@ -1967,6 +2022,7 @@ def run_crawler(
         llm_test=llm_test,
         include_urls=include_urls,
         include_external=include_external,
+        signature_api_keys=signature_api_keys,
         comments_enabled=comments_enabled,
         random_user_agent=random_user_agent,
         user_agent=user_agent,
@@ -2008,6 +2064,7 @@ def print_banner(
     llm_test=False,
     include_urls=False,
     include_external=False,
+    signature_api_keys=True,
     comments_enabled=False,
     random_user_agent=False,
     user_agent="",
@@ -2025,7 +2082,7 @@ def print_banner(
     print(banner)
     print(f"{APP_NAME} v{APP_VERSION} | Target: {start_url}")
     print(f"Max pages: {max_pages} | Max text bytes: {max_text_bytes} | Verbose: {verbose}")
-    print(f"Stream findings.jsonl: {stream_findings} | Include URLs: {include_urls} | Include External: {include_external} | Include Comments: {comments_enabled} | Random UA: {random_user_agent} | User-Agent: {user_agent or '<default>'}")
+    print(f"Stream findings.jsonl: {stream_findings} | Include URLs: {include_urls} | Include External: {include_external} | Signature API Keys: {signature_api_keys} | Include Comments: {comments_enabled} | Random UA: {random_user_agent} | User-Agent: {user_agent or '<default>'}")
     if llm:
         llm_scope = "all_findings" if bool(llm_validate_all) else "candidates_only"
         llm_budget = "unlimited" if int(llm_max_checks) <= 0 else str(llm_max_checks)
@@ -2115,6 +2172,21 @@ if __name__ == "__main__":
         action="store_true",
         help="Include external asset references such as CSS, PDF, DOCX and XLSX files in the output.",
     )
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--signature-api-keys",
+        dest="signature_api_keys",
+        action="store_true",
+        help="Enable signature-based API key detection from provider patterns like sk- and ghp- (default).",
+    )
+    group.add_argument(
+        "--no-signature-api-keys",
+        dest="signature_api_keys",
+        action="store_false",
+        help="Disable provider signature-based API key detection.",
+    )
+    parser.set_defaults(signature_api_keys=True)
+
     parser.add_argument(
         "--random-user-agent",
         action="store_true",
@@ -2150,6 +2222,7 @@ if __name__ == "__main__":
         llm_test=args.test,
         include_urls=args.include_urls,
         include_external=args.include_external,
+        signature_api_keys=args.signature_api_keys,
         comments_enabled=args.include_comments,
         random_user_agent=args.random_user_agent,
         user_agent=args.user_agent,
