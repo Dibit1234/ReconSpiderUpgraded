@@ -16,3 +16,5 @@ build/
 results.json
 findings.jsonl
 
+recon-*/
+tests/fixtures/
