@@ -73,11 +73,20 @@ S = {
     "gocspx": "GOC" + "SPX-" + rnd(28),
     "azure_key": rnd(86, string.ascii_letters + string.digits + "+/") + "==",
     "env_db": "pr0d-Db-P4ss-77",
+    "lazy_chunk": "gl" + "pat-" + rnd(20, string.ascii_letters + string.digits + "_-"),
+    "next_route": "lin" + "_api_" + rnd(40),
+    "next_chunk": "h" + "f_" + rnd(34),
+    "cra_orphan": "dp" + ".pt." + rnd(43),
+    "data_link": "PM" + "AK-" + rnd(24, HEX) + "-" + rnd(34, HEX),
+    "js_nav": "gl" + "sa_" + rnd(32) + "_" + rnd(8, HEX),
+    "sitemap_idx": "xkey" + "sib-" + rnd(64, HEX) + "-" + rnd(16),
+    "dd_api": rnd(32, HEX),
 }
 S["basic_b64"] = base64.b64encode(f"{S['basic_user']}:{S['basic_pw']}".encode()).decode()
 
 # Public-by-design (should be info, not counted as TP or FP)
 P = {
+    "dd_rum": "pub" + rnd(32, HEX),
     "google_key": "AI" + "za" + rnd(35, string.ascii_letters + string.digits + "_-"),
     "stripe_pk": "pk" + "_live_" + rnd(32),
     "supabase_anon": jwt({"iss": "supabase", "ref": rnd(20, string.ascii_lowercase), "role": "anon", "iat": 1700000000, "exp": 2700000000}),
@@ -121,8 +130,19 @@ TRUE_POSITIVES = {
     "email_obfuscated": "it-support@acme-corp.com",
     "email_cfemail": "billing@acme-corp.com",
     "email_plain": "jane.smith@acme-corp.com.au",
+    "webpack_lazy_chunk": S["lazy_chunk"],
+    "nextjs_manifest_route": S["next_route"],
+    "nextjs_manifest_chunk": S["next_chunk"],
+    "cra_asset_manifest_chunk": S["cra_orphan"],
+    "data_attribute_link": S["data_link"],
+    "js_navigation_link": S["js_nav"],
+    "sitemap_index_page": S["sitemap_idx"],
+    "datadog_api_key": S["dd_api"],
+    "lookalike_email_domain": "acme-crop.com",
+    "mock_bundle_flagged": "/static/js/browser-D74W5xup.js",
+    "bulk_ip_list": "/downloads/blocklist.txt#public_ip_list",
 }
-PROBE_TRUE_POSITIVES = {"exposed_env_file": "/.env", "env_db_password": S["env_db"]}
+PROBE_TRUE_POSITIVES = {"exposed_env_file": "/.env", "env_db_password": S["env_db"], "openapi_spec": "/openapi.json", "graphql_introspection": "/graphql"}
 PUBLIC = set(P.values())
 
 # Values that must NOT show up as a finding of severity >= low.
@@ -131,6 +151,7 @@ DECOY_VALUES = [
     "e.user", "process.env.REACT_APP_API_KEY", "YOUR_API_KEY_HERE", D["aws_doc_id"], D["aws_doc_secret"],
     "pk.data.items", "sk-toggle-collapsed-sidebar", "key-value-store-identifier-x", "12.150.18.40",
     "1.2.3.4", D["jwt_sample"], D["gh_bad"], D["sitekey"], D["integrity"], "access_token", "app.auth.token",
+    P["dd_rum"], "kag0Uk2wvbMTOPi", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9", "http://mailto:press@acme-corp.com", "10.10.10.10",
     "user:password", "/reset", "8.8.8.8", "a::before", "12:30:45", "-----BEGIN RSA PRIVATE KEY-----",
 ]
 
@@ -144,6 +165,8 @@ def layout(title, body, extra_head=""):
 <link rel="stylesheet" href="/static/css/site.css?v={R.randint(1, 9999)}">
 <link rel="icon" href="/static/img/logo@2x.png">
 <script src="/static/js/app.js?v={R.randint(1, 9999)}"></script>
+<script src="/static/js/runtime.4c3b2a19.js"></script>
+<script>window.DD_RUM && window.DD_RUM.init({{ clientToken: '{P["dd_rum"]}', applicationId: '3816bfdf-6698-4c50-aafa-f16770d1a433', site: 'datadoghq.com' }});</script>
 <script src="/static/js/vendor/jquery-3.6.0.min.js"></script>
 <script>window.dataLayer=window.dataLayer||[];function gtag(){{dataLayer.push(arguments)}};gtag('config','G-ABCDEF1234');</script>
 {extra_head}
@@ -151,7 +174,9 @@ def layout(title, body, extra_head=""):
 </head><body>
 <header><nav><a href="/">Home</a> <a href="/about">About</a> <a href="/blog">Blog</a> <a href="/shop">Shop</a>
 <a href="/login">Login</a> <a href="/settings">Settings</a> <a href="/staff">Staff</a> <a href="/docs/a">Docs</a>
-<a href="/calendar/2026/11">Events</a> <a href="/logout">Log out</a></nav>
+<a href="/calendar/2026/11">Events</a> <a href="/logout">Log out</a> <a href="/contact">Contact</a> <a href="/next-app">App</a>
+<span class="card" data-target-url="/data-linked">Offers</span> <button onclick="location.href='/js-nav'">Quote</button>
+<a href="http://mailto:press@acme-corp.com">Press</a></nav>
 <img src="/static/img/logo@2x.png" alt="logo"></header>
 <main>{body}</main>
 <footer>Our products are available at acme-corp.com and partner stores. Opening hours 09:00 - 17:00.
@@ -172,12 +197,12 @@ HOME = layout(
 <script src="https://cdn.example.net/lib.js" integrity="{D['integrity']}"></script>""",
 )
 
-ABOUT = layout("About", f"""<p>About us</p><script>var ghCfg = {{ deployToken: "{S['gh']}" }}; var docsExample = "{D['gh_bad']}";</script>""")
+ABOUT = layout("About", f"""<p>About us</p><a href="/downloads/blocklist.txt">Blocked networks</a><script>var ghCfg = {{ deployToken: "{S['gh']}" }}; var docsExample = "{D['gh_bad']}";</script>""")
 LOGIN = layout(
     "Login",
     f"""<form method=post><input name=username><input type=password name=password></form>
 <script>const sb = createClient("https://xyz.supabase.co", "{P['supabase_anon']}"); const admin = createClient("https://xyz.supabase.co", "{S['supabase_svc']}");
-const sample = "{D['jwt_sample']}";</script>""",
+const sample = "{D['jwt_sample']}";</script><script src="/static/js/browser-D74W5xup.js"></script>""",
 )
 SETTINGS = layout("Settings", f"""<script>var cfg = {{ admin_password: "{S['admin_password']}", password_reset_url: "/reset", passwordLabel: "Password" }};</script>""")
 STAFF = layout("Staff", f"""<form><input type="password" name="pw" value="{S['prefilled']}"></form><script>var bot = "{S['telegram']}";</script>""")
@@ -245,7 +270,48 @@ def calendar(y, m):
     return layout(f"Cal {y}-{m}", f'<a href="/calendar/{ny}/{nm}">Next month</a> <a href="/calendar/{y}/{m}?view=week">Week</a>')
 
 
+RUNTIME_JS = (
+    '!function(){var r={},n={};n.p="/";n.u=function(e){return"static/js/"+e+"."+{345:"9f8e7d6c",346:"aa00bb11"}[e]+".chunk.js"};'
+    'n.e=function(e){/* webpack chunk loader */}}();'
+)
+LAZY_CHUNK = f'(self.webpackChunkacme=self.webpackChunkacme||[]).push([[345],{{77:function(e,t){{t.ciToken="{S["lazy_chunk"]}"}}}}]);'
+MSW_BUNDLE = (
+    'console.warn("[MSW] Mocking enabled.");var ge={post:function(){}},pe={API_HOST:""},le={json:function(x){return x}};'
+    'ge.post(pe.API_HOST+"/api/v1/PayNow/completecollection",()=>le.json({QuoteID:123456,PaymentGatewayAuthToken:\'{"access_token":"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9","token_type":"bearer","expires_in":1799}\'}));'
+    'le.json({ClientID:12345678,QuoteID:87654321,ClientValid:!0,EvolveUpdatePaymentDetailsToken:"kag0Uk2wvbMTOPi",ClientIpAddress:"10.10.10.10"});'
+)
+NEXT_PAGE = layout("Next app", '<div id="__next"></div><script id="__NEXT_DATA__" type="application/json">{"props":{},"page":"/next-app","buildId":"bld7Qx2kLm9","isFallback":false}</script><script src="/_next/static/chunks/main-0a1b2c3d.js"></script>')
+NEXT_MANIFEST = 'self.__BUILD_MANIFEST={"/next-app":["static/chunks/pages/next-app-11aa22bb.js"],"/hidden-route":["static/chunks/pages/hidden-route-aa11bb22.js"],"/posts/[slug]":["static/chunks/pages/posts/[slug]-cc33dd44.js"]};self.__BUILD_MANIFEST_CB&&self.__BUILD_MANIFEST_CB();'
+HIDDEN_ROUTE = layout("Hidden", f"<script>window.linear = {{ apiKey: '{S['next_route']}' }};</script>")
+NEXT_CHUNK = f'(self.webpackChunk_N_E=self.webpackChunk_N_E||[]).push([[405],{{1:function(){{const hfToken="{S["next_chunk"]}"}}}}]);'
+ASSET_MANIFEST = json.dumps({"files": {"main.js": "/static/js/main.1a2b3c4d.js", "orphan.js": "/static/js/orphan.5a5a5a5a.js"}, "entrypoints": ["static/js/main.1a2b3c4d.js"]})
+ORPHAN_JS = f'var doppler={{token:"{S["cra_orphan"]}"}};'
+DATA_LINKED = layout("Offers", f"<script>var pm = '{S['data_link']}';</script>")
+JS_NAV = layout("Quote", f"<script>var graf = {{ token: '{S['js_nav']}' }};</script>")
+CONTACT = layout("Contact", '<script type="application/ld+json">{"@type":"Organization","email":"help@acme-crop.com","telephone":"1300 000 000"}</script><p>Email <a href="mailto:sales@acme-corp.com">sales@acme-corp.com</a></p>')
+SITEMAP_ONLY_2 = layout("Spring promo", f"<script>var brevo = '{S['sitemap_idx']}';</script>")
+DD_CFG = f'var monitoring={{datadog_api_key:"{S["dd_api"]}",site:"datadoghq.com"}};'
+BLOCKLIST = "\n".join(f"{R.randint(11, 200)}.{R.randint(0, 255)}.{R.randint(0, 255)}.{R.randint(1, 254)}" for _ in range(120))
+OPENAPI = json.dumps({"openapi": "3.0.1", "info": {"title": "Acme API", "version": "1.4"}, "servers": [{"url": "/api"}], "paths": {"/v1/users": {}, "/v1/admin/export": {}, "/v1/payments/{id}": {}}})
+
 STATIC = {
+    "/static/js/runtime.4c3b2a19.js": ("application/javascript", RUNTIME_JS, {}),
+    "/static/js/345.9f8e7d6c.chunk.js": ("application/javascript", LAZY_CHUNK, {}),
+    "/static/js/browser-D74W5xup.js": ("application/javascript", MSW_BUNDLE, {}),
+    "/next-app": ("text/html", NEXT_PAGE, {}),
+    "/_next/static/bld7Qx2kLm9/_buildManifest.js": ("application/javascript", NEXT_MANIFEST, {}),
+    "/_next/static/chunks/pages/hidden-route-aa11bb22.js": ("application/javascript", NEXT_CHUNK, {}),
+    "/_next/static/chunks/main-0a1b2c3d.js": ("application/javascript", "console.log(1)", {}),
+    "/hidden-route": ("text/html", HIDDEN_ROUTE, {}),
+    "/asset-manifest.json": ("application/json", ASSET_MANIFEST, {}),
+    "/static/js/orphan.5a5a5a5a.js": ("application/javascript", ORPHAN_JS, {}),
+    "/static/js/main.1a2b3c4d.js": ("application/javascript", DD_CFG, {}),
+    "/data-linked": ("text/html", DATA_LINKED, {}),
+    "/js-nav": ("text/html", JS_NAV, {}),
+    "/contact": ("text/html", CONTACT, {}),
+    "/promo/spring-2": ("text/html", SITEMAP_ONLY_2, {}),
+    "/downloads/blocklist.txt": ("text/plain", BLOCKLIST, {}),
+    "/openapi.json": ("application/json", OPENAPI, {}),
     "/": ("text/html", HOME, {"X-Backend-Server": "10.20.30.40"}),
     "/about": ("text/html", ABOUT, {}),
     "/login": ("text/html", LOGIN, {}),
@@ -311,6 +377,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, "text/html", calendar(int(parts[1]), int(parts[2])))
             except (IndexError, ValueError):
                 pass
+        if path == "/sitemap_index.xml":
+            return self._send(200, "application/xml", f'<?xml version="1.0"?><sitemapindex><sitemap><loc>http://{host}/sitemap-posts.xml</loc></sitemap></sitemapindex>')
+        if path == "/sitemap-posts.xml":
+            return self._send(200, "application/xml", f'<?xml version="1.0"?><urlset><url><loc>http://{host}/promo/spring-2</loc></url></urlset>')
+        if path == "/graphql":
+            if "__schema" in query.replace("%5F", "_"):
+                return self._send(200, "application/json", json.dumps({"data": {"__schema": {"queryType": {"name": "Query"}, "mutationType": {"name": "Mutation"}, "types": [{"name": "Query"}, {"name": "User"}, {"name": "Mutation"}]}}}))
+            if "__typename" in query.replace("%5F", "_"):
+                return self._send(200, "application/json", '{"data":{"__typename":"Query"}}')
+            return self._send(400, "application/json", '{"errors":[{"message":"Must provide query string."}]}')
         if path.startswith("/api/"):
             return self._send(404, "application/json", '{"error":"not found"}')
         if path.startswith("/static/"):

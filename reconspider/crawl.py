@@ -10,7 +10,7 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
 import scrapy
 
-from .detect import Detector, ENV_LINE_RE, is_vendor, registrable_domain
+from .detect import Detector, is_vendor, registrable_domain
 
 # --------------------------------------------------------------------------- #
 # URL helpers
@@ -53,17 +53,100 @@ COMMENT_RE = re.compile(r"(?s)<!--(.*?)-->")
 META_REFRESH_RE = re.compile(r"(?i)<meta[^>]+http-equiv=[\"']?refresh[^>]+content=[\"'][^\"']*url=([^\"'>]+)")
 SITEMAP_LOC_RE = re.compile(r"(?is)<loc>\s*(.*?)\s*</loc>")
 
-PROBE_PATHS = [
-    "/.env", "/.env.local", "/.env.production", "/.env.prod", "/.env.development", "/.env.backup",
-    "/.env.bak", "/.env.old", "/api/.env", "/backend/.env",
-    "/config.json", "/config.js", "/env.js", "/env.json", "/__env.js", "/env-config.js",
-    "/runtime-config.js", "/app-config.json", "/appsettings.json", "/appsettings.Development.json",
-    "/settings.json", "/assets/config.json", "/assets/env.json", "/static/config.json",
-    "/.git/config", "/.npmrc", "/.aws/credentials", "/docker-compose.yml", "/docker-compose.yaml",
-    "/web.config", "/sftp-config.json", "/.vscode/sftp.json", "/wp-config.php.bak", "/wp-config.php.old",
-    "/wp-config.php~", "/config.php.bak", "/.htpasswd", "/server-status", "/phpinfo.php",
+PAGE_ABS_URL_RE = re.compile(r"""["'`](https?://[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?::\d{2,5})?(?:/[^\s"'`<>\\]{0,300})?)["'`]""")
+JS_NAV_RE = re.compile(r"""(?:location(?:\.href)?\s*=|location\.(?:assign|replace)\(|window\.open\(|navigate\(|router\.push\(|href\s*:)\s*["'`](/[^"'`\s<>]{1,200})["'`]""")
+DATA_LINK_RE = re.compile(r"""\bdata-[\w-]*(?:url|href|link|path|src|route)\s*=\s*["']([^"'<>\s]{1,300})["']""", re.I)
+NEXT_BUILD_ID_RE = re.compile(r'"buildId"\s*:\s*"([A-Za-z0-9_-]{6,64})"')
+WEBPACK_PUBLIC_PATH_RE = re.compile(r"""\.p\s*=\s*["']([^"']{0,200})["']""")
+# __webpack_require__.u = e => "static/js/" + e + "." + {12:"a1b2c3d4", ...}[e] + ".chunk.js"
+WEBPACK_CHUNK_RE = re.compile(
+    r"""["']([\w./-]{0,120})["']\s*\+\s*(?:\(\s*\{[^{}]{0,20000}\}\[\s*\w+\s*\]\s*\|\|\s*\w+\s*\)|\w+)\s*\+\s*["']([.-])["']\s*\+\s*\{([^{}]{4,200000})\}\[\s*\w+\s*\]\s*\+\s*["']([\w.-]{0,40}\.m?js)["']"""
+)
+WEBPACK_NAMES_RE = re.compile(r"""\+\s*\(\s*\{([^{}]{0,20000})\}\[\s*\w+\s*\]\s*\|\|\s*\w+\s*\)\s*\+""")
+CHUNK_PAIR_RE = re.compile(r"""(?:^|,)\s*["']?([\w-]{1,80})["']?\s*:\s*["']([\w-]{4,40})["']""")
+CONFIG_ENDPOINT_RE = re.compile(r"(?i)(?:config|settings|env(?:ironment)?|bootstrap|runtime|init|feature-?flags|public-?keys?|well-known)(?:\.json)?/?$")
+
+# --------------------------------------------------------------------------- #
+# Probes: (path, check, severity, title). check() gets (text, body, is_html).
+# Only GET requests; content is validated so soft-404s / SPA shells never hit.
+# --------------------------------------------------------------------------- #
+
+
+def _json(text):
+    try:
+        return json.loads(text)
+    except ValueError:
+        return None
+
+
+def _env_ok(t, b, html):
+    return not html and re.search(r"(?m)^[ \t]*(?:export[ \t]+)?[A-Z_][A-Z0-9_]*[ \t]*=", t) is not None
+
+
+def _spec_ok(t, b, html):
+    d = _json(t)
+    return isinstance(d, dict) and ("openapi" in d or "swagger" in d) and isinstance(d.get("paths"), dict)
+
+
+def _json_ok(t, b, html):
+    return not html and isinstance(_json(t), (dict, list))
+
+
+PROBES = [
+    # secrets / config
+    *[(p, _env_ok, "high", "Exposed environment file") for p in (
+        "/.env", "/.env.local", "/.env.production", "/.env.prod", "/.env.development", "/.env.dev",
+        "/.env.staging", "/.env.backup", "/.env.bak", "/.env.old", "/.env.save", "/api/.env", "/backend/.env", "/app/.env")],
+    ("/.aws/credentials", lambda t, b, h: "aws_access_key_id" in t.lower(), "critical", "Exposed AWS credentials file"),
+    ("/.htpasswd", lambda t, b, h: re.search(r"(?m)^[^:\s<]+:\$?[\w./$]{10,}", t) is not None, "high", "Exposed .htpasswd"),
+    ("/.npmrc", lambda t, b, h: not h and ("registry" in t or "_auth" in t), "medium", "Exposed .npmrc"),
+    ("/.git/config", lambda t, b, h: "[core]" in t, "high", "Exposed .git repository"),
+    ("/.git/HEAD", lambda t, b, h: re.match(r"ref: refs/|[0-9a-f]{40}\s*$", t.strip()) is not None, "high", "Exposed .git repository"),
+    ("/.svn/entries", lambda t, b, h: not h and (t.strip()[:2].isdigit() or "svn:" in t), "medium", "Exposed .svn metadata"),
+    ("/.svn/wc.db", lambda t, b, h: b[:15] == b"SQLite format 3", "medium", "Exposed .svn metadata"),
+    ("/.DS_Store", lambda t, b, h: b[:8] == b"\x00\x00\x00\x01Bud1", "low", "Exposed .DS_Store (lists directory contents)"),
+    ("/docker-compose.yml", lambda t, b, h: not h and "services:" in t, "medium", "Exposed docker-compose file"),
+    ("/docker-compose.yaml", lambda t, b, h: not h and "services:" in t, "medium", "Exposed docker-compose file"),
+    ("/web.config", lambda t, b, h: "<configuration" in t.lower(), "medium", "Exposed web.config"),
+    ("/sftp-config.json", _json_ok, "high", "Exposed SFTP config"),
+    ("/.vscode/sftp.json", _json_ok, "high", "Exposed SFTP config"),
+    *[(p, lambda t, b, h: "DB_PASSWORD" in t or "<?php" in t, "critical", "Exposed config backup") for p in (
+        "/wp-config.php.bak", "/wp-config.php.old", "/wp-config.php~", "/wp-config.php.save", "/wp-config.bak", "/config.php.bak")],
+    # public config files: reported as info, their contents are scanned for secrets
+    *[(p, _json_ok, "info", "Public config file") for p in (
+        "/config.json", "/env.json", "/app-config.json", "/appsettings.json", "/appsettings.Development.json",
+        "/settings.json", "/assets/config.json", "/assets/env.json", "/static/config.json", "/api/config",
+        "/api/v1/config", "/api/settings", "/api/env", "/config")],
+    *[(p, lambda t, b, h: not h and ("=" in t or ":" in t), "info", "Public config file") for p in (
+        "/config.js", "/env.js", "/__env.js", "/env-config.js", "/runtime-config.js", "/assets/env.js")],
+    # API surface
+    *[(p, _spec_ok, "low", "API specification exposed") for p in (
+        "/swagger.json", "/openapi.json", "/api/swagger.json", "/api/openapi.json", "/v2/api-docs", "/v3/api-docs",
+        "/api-docs", "/api/v1/swagger.json", "/swagger/v1/swagger.json", "/api/swagger/v1/swagger.json", "/openapi.yaml.json")],
+    *[(p, lambda t, b, h: "swagger-ui" in t.lower() and ("SwaggerUIBundle" in t or "swagger-ui.css" in t), "low", "Swagger UI exposed") for p in (
+        "/swagger-ui.html", "/swagger-ui/", "/swagger/", "/api/docs", "/docs", "/api-docs/")],
+    *[(p, lambda t, b, h: isinstance(_json(t), dict) and (_json(t).get("data") or {}).get("__typename") is not None, "info", "GraphQL endpoint") for p in (
+        "/graphql?query=%7B__typename%7D", "/api/graphql?query=%7B__typename%7D", "/graphql/v1?query=%7B__typename%7D", "/v1/graphql?query=%7B__typename%7D")],
+    ("/actuator", lambda t, b, h: isinstance(_json(t), dict) and "_links" in _json(t), "low", "Spring Boot actuator exposed"),
+    ("/actuator/env", lambda t, b, h: "propertySources" in t, "high", "Spring Boot actuator /env exposed"),
+    ("/actuator/configprops", lambda t, b, h: "contexts" in t and "beans" in t, "medium", "Spring Boot actuator /configprops exposed"),
+    ("/actuator/mappings", lambda t, b, h: "dispatcherServlets" in t or "mappings" in t and "contexts" in t, "low", "Spring Boot actuator /mappings exposed"),
+    ("/env", lambda t, b, h: "propertySources" in t or "profiles" in t and "systemProperties" in t, "high", "Spring Boot /env exposed"),
+    ("/wp-json/wp/v2/users", lambda t, b, h: isinstance(_json(t), list) and bool(_json(t)) and isinstance(_json(t)[0], dict) and "slug" in _json(t)[0], "medium", "WordPress user enumeration"),
+    ("/elmah.axd", lambda t, b, h: "Error Log for" in t, "high", "ELMAH error log exposed"),
+    ("/trace.axd", lambda t, b, h: "Application Trace" in t, "medium", "ASP.NET trace exposed"),
+    ("/phpinfo.php", lambda t, b, h: "phpinfo()" in t or "PHP Version" in t, "medium", "phpinfo() exposed"),
+    ("/info.php", lambda t, b, h: "phpinfo()" in t or "PHP Version" in t and "<table" in t, "medium", "phpinfo() exposed"),
+    ("/server-status", lambda t, b, h: "Apache Server Status" in t, "low", "Apache server-status exposed"),
+    ("/server-info", lambda t, b, h: "Apache Server Information" in t, "low", "Apache server-info exposed"),
+    ("/crossdomain.xml", lambda t, b, h: re.search(r"allow-access-from\s+domain=[\"']\*[\"']", t) is not None, "low", "Permissive crossdomain.xml"),
+    ("/clientaccesspolicy.xml", lambda t, b, h: re.search(r"<domain\s+uri=[\"']\*[\"']", t) is not None, "low", "Permissive clientaccesspolicy.xml"),
 ]
-PROBE_SEVERITY = {".env": "high", ".git/config": "medium", ".aws/credentials": "critical", ".htpasswd": "high", ".npmrc": "medium", "wp-config": "critical", "phpinfo": "medium", "server-status": "low"}
+BINARY_PROBES = {"/.DS_Store", "/.svn/wc.db"}
+# .DS_Store record: UTF-16BE filename followed by a 4-char structure type
+DS_STORE_ENTRY_RE = re.compile(
+    rb"((?:\x00[\x20-\x7e]){1,255})(?:Iloc|bwsp|lsvp|lsvP|icvp|BKGD|cmmt|dilc|dscl|fwi0|fwsw|fwvh|GRP0|ICVO|icgo|icsp|info|logS|lg1S|lssp|modD|moDD|phyS|ph1S|pict|vstl|vSrn|ptbL|ptbN|extn|kind|mdat|mdcd|lsvt|lsvC)(?:bool|long|shor|type|ustr|blob|comp|dutc)"
+)
 
 
 def sha1(data):
@@ -142,6 +225,8 @@ def template_of(url):
             segs.append("{slug}")
         elif SEG_ID.match(seg) and re.search(r"\d", seg):
             segs.append("{id}")
+        elif re.search(r"[-_]", seg) and re.search(r"\d", seg) and re.search(r"[A-Za-z]{2}", seg):
+            segs.append("{slug}")  # oak-chair-123, post_42, sku-9912-red
         else:
             segs.append(seg.lower())
     keys = ",".join(sorted({k.lower() for k, _ in parse_qsl(p.query, keep_blank_values=True)}))
@@ -175,10 +260,16 @@ def is_binary(body):
 class TargetSpider(scrapy.Spider):
     name = "reconspider"
 
-    def __init__(self, target, opts, sink, scheme_assumed=False, *args, **kwargs):
+    def __init__(self, target, opts, sink, scheme_assumed=False, extra_seeds=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.target = target
+        self.extra_seeds = list(extra_seeds or [])
         self.scheme_assumed = scheme_assumed
+        self.discovered_hosts = set()  # hosts on the target's registrable domain
+        self.external_refs = {}  # host -> {"link", "script", "iframe", "form", "js_ref", "email"}
+        self.seeded_hosts = set()
+        self.next_build_ids = set()
+        self.config_probes = 0
         self.start_ok = False
         self.start_error = None
         self.o = opts
@@ -202,7 +293,9 @@ class TargetSpider(scrapy.Spider):
         self.seen_lines = set()
         self.seen_scripts = set()
         self.seen_headers = set()
+        self.seen_sitemaps = set()
         self.template_counts = {}
+        self.template_children = {}
 
         # findings: (rule, value) -> finding
         self.findings = {}
@@ -234,9 +327,28 @@ class TargetSpider(scrapy.Spider):
 
     def seed_requests(self):
         base = f"{self.scope.scheme}://{urlparse(self.target).netloc}"
+        # Extra start pages from the target list (same host): always crawled,
+        # bypass template caps, depth 0.
+        for s in self.extra_seeds:
+            p = urlparse(s)
+            url = base + (p.path or "/") + (("?" + p.query) if p.query else "")
+            key = normalize(url, self.scope)
+            if key in self.seen_pages:
+                continue
+            self.seen_pages.add(key)
+            self.stats["pages_scheduled"] += 1
+            yield scrapy.Request(url, callback=self.parse_page, errback=self.on_error, priority=950, meta={"depth": 0, "download_maxsize": self.o.max_text_bytes})
         if self.o.seed:
             yield scrapy.Request(base + "/robots.txt", callback=self.parse_robots, errback=self.on_error, priority=900, meta={"depth": 1, "dont_redirect": False})
-            yield scrapy.Request(base + "/sitemap.xml", callback=self.parse_sitemap, errback=self.on_error, priority=-50, meta={"depth": 1, "sitemap_level": 0})
+            for sm in ("/sitemap.xml", "/sitemap_index.xml", "/sitemap-index.xml", "/wp-sitemap.xml", "/sitemap.xml.gz"):
+                r = self.sitemap_request(base + sm, 0)
+                if r:
+                    yield r
+            # Build manifests list every JS chunk (and for some, every route)
+            for mf in ("/asset-manifest.json", "/.vite/manifest.json", "/manifest.json", "/build-manifest.json"):
+                r = self.asset_request(base + mf, "json", callback=self.parse_build_manifest, priority=60)
+                if r:
+                    yield r
         if self.o.probe:
             rnd = "".join(random.choices(string.ascii_lowercase, k=14))
             yield scrapy.Request(f"{base}/{rnd}.env", callback=self.parse_baseline, errback=self.on_error, priority=950, dont_filter=True, meta={"depth": 1, "base": base, "handle_httpstatus_all": True})
@@ -251,6 +363,8 @@ class TargetSpider(scrapy.Spider):
                 f["locations"] = [f["url"]]
                 self.findings[key] = f
                 self.sink(self, f)
+                if f["rule"] == "email":
+                    self.note_host("https://" + f["value"].partition("@")[2] + "/", "email")
             else:
                 cur["occurrences"] += 1
                 if f["url"] not in cur["locations"] and len(cur["locations"]) < 5:
@@ -318,7 +432,7 @@ class TargetSpider(scrapy.Spider):
         key = normalize(url, self.scope)
         if key in self.seen_pages:
             return None
-        tpl = template_of(key)
+        tpl = self.adaptive_template(template_of(key))
         n = self.template_counts.get(tpl, 0)
         if n >= self.o.max_per_template:
             self.stats["skipped_template_cap"] += 1
@@ -428,15 +542,34 @@ class TargetSpider(scrapy.Spider):
         # 3. links
         try:
             sel = response
-            hrefs = sel.css("a::attr(href), area::attr(href), iframe::attr(src), frame::attr(src), form::attr(action), [data-href]::attr(data-href), [data-url]::attr(data-url)").getall()
+            anchors = sel.css("a::attr(href), area::attr(href)").getall()
+            frames = sel.css("iframe::attr(src), frame::attr(src)").getall()
+            forms = sel.css("form::attr(action)").getall()
             link_rel = sel.xpath("//link[@href]")
             scripts = sel.css("script::attr(src)").getall()
             self.form_fields.update(x for x in sel.css("input::attr(name), textarea::attr(name), select::attr(name)").getall() if len(self.form_fields) < 5000)
         except (ValueError, AttributeError):
             return
+        hrefs = anchors + frames + forms
+        # Links hidden in data-* attributes and onclick / JS navigation
+        hrefs += [m.group(1) for m in DATA_LINK_RE.finditer(text)]
+        hrefs += [m.group(1) for m in JS_NAV_RE.finditer(text)]
+        for kind, vals in (("link", anchors), ("iframe", frames), ("form", forms)):
+            for v in vals:
+                self.note_host(response.urljoin(v.strip()), kind)
+
+        for bid in NEXT_BUILD_ID_RE.findall(text)[:2]:
+            if bid not in self.next_build_ids and "/_next/" in text:
+                self.next_build_ids.add(bid)
+                origin = f"{urlparse(response.url).scheme}://{urlparse(response.url).netloc}"
+                for name in ("_buildManifest.js", "_ssgManifest.js"):
+                    r = self.asset_request(f"{origin}/_next/static/{bid}/{name}", "js", callback=self.parse_build_manifest, priority=70)
+                    if r:
+                        yield r
 
         for src in scripts:
             url = response.urljoin(src.strip())
+            self.note_host(url, "script")
             self.js_files.add(url)
             r = self.asset_request(url, "js")
             if r:
@@ -468,6 +601,58 @@ class TargetSpider(scrapy.Spider):
                 self.record(self.det.scan(href, response.url, "html"))
                 continue
             r = self.page_request(response.urljoin(href), response, priority=-depth * 10)
+            if r:
+                yield r
+        yield from self.drain_subdomain_seeds()
+
+    MAX_CHILDREN = 25
+
+    def adaptive_template(self, tpl):
+        """Once a folder has many distinct children (/category/<30 names>,
+        /product/<slug>), treat its last segment as a variable so the
+        per-template cap applies to the rest."""
+        path, _, q = tpl.partition("?")
+        parent, _, last = path.rpartition("/")
+        if not parent or last.startswith("{"):
+            return tpl
+        kids = self.template_children.setdefault((parent, q), set())
+        if last in kids:
+            return tpl
+        if len(kids) < self.MAX_CHILDREN:
+            kids.add(last)
+            return tpl
+        return f"{parent}/{{var}}?{q}"
+
+    # ---------------------------------------------------------------- hosts
+    def note_host(self, url, kind):
+        """Track every host the site references (inventory, lookalike and
+        dangling-domain checks) and queue newly seen subdomains."""
+        try:
+            p = urlparse(url)
+            host = (p.hostname or "").lower().rstrip(".")
+        except ValueError:
+            return
+        if not host or "." not in host or p.scheme not in {"http", "https", ""}:
+            return
+        if registrable_domain(host) == self.scope.site:
+            if host not in self.scope.page_hosts:
+                self.discovered_hosts.add(host)
+            return
+        refs = self.external_refs.get(host)
+        if refs is None:
+            if len(self.external_refs) >= 3000:
+                return
+            refs = self.external_refs[host] = set()
+        refs.add(kind)
+
+    def drain_subdomain_seeds(self):
+        if not self.o.include_subdomains:
+            return
+        for host in sorted(self.discovered_hosts - self.seeded_hosts):
+            if len(self.seeded_hosts) >= self.o.max_subdomains:
+                return
+            self.seeded_hosts.add(host)
+            r = self.page_request(f"{self.scope.scheme}://{host}/", None, priority=5, source="subdomain")
             if r:
                 yield r
 
@@ -514,11 +699,41 @@ class TargetSpider(scrapy.Spider):
 
     def discover_in_js(self, text, base_url):
         out = []
-        if len(self.endpoints) < 3000:
-            for m in ENDPOINT_RE.finditer(text):
-                self.endpoints.add(m.group(1)[:300])
         base = urlparse(base_url)
         origin = f"{base.scheme}://{base.netloc}"
+        new_endpoints = []
+        if len(self.endpoints) < 3000:
+            for m in ENDPOINT_RE.finditer(text):
+                ep = m.group(1)[:300]
+                if ep not in self.endpoints:
+                    self.endpoints.add(ep)
+                    new_endpoints.append(ep)
+        # Config-style API endpoints (/api/config, /api/v1/settings) often
+        # return keys; GET them when --probe is on. Bounded and read-only.
+        if self.o.probe:
+            for ep in new_endpoints:
+                if self.config_probes >= 30 or "{" in ep or "$" in ep or not CONFIG_ENDPOINT_RE.search(ep.split("?", 1)[0]):
+                    continue
+                url = ep if ep.startswith("http") else origin + ep
+                r = self.asset_request(url, "json", priority=35)
+                if r:
+                    self.config_probes += 1
+                    out.append(r)
+        # Absolute URLs: inventory every host; same-site pages get crawled
+        if "://" in text:
+            n_pages = 0
+            for m in PAGE_ABS_URL_RE.finditer(text):
+                u = m.group(1)
+                self.note_host(u, "js_ref")
+                p = urlparse(u)
+                if n_pages < 50 and self.scope.page_ok(p.hostname, p.port, p.scheme) and not ASSET_EXT_RE.search(p.path) and "${" not in u and "{" not in p.path:
+                    r = self.page_request(u, None, priority=-30, source="js")
+                    if r:
+                        n_pages += 1
+                        out.append(r)
+        # Webpack runtime chunk maps: lazy chunks never appear as literal paths
+        if "+" in text and ("webpack" in text or "chunk" in text):
+            out.extend(self._webpack_chunks(text, base_url, origin))
         for m in JS_PATH_RE.finditer(text):
             path = m.group(1)
             fname = path.rsplit("/", 1)[-1]
@@ -537,6 +752,87 @@ class TargetSpider(scrapy.Spider):
             if r:
                 out.append(r)
         return out
+
+    def _webpack_chunks(self, text, base_url, origin):
+        out = []
+        pm = WEBPACK_PUBLIC_PATH_RE.search(text)
+        public = pm.group(1) if pm else "/"
+        if public.startswith(("http://", "https://", "//")):
+            root = urljoin(base_url, public)
+        elif public.startswith("/"):
+            root = origin + public
+        elif public in ("", "auto", "./"):
+            root = base_url.rsplit("/", 1)[0] + "/"
+            # CRA/Next put the runtime in static/js/ while the template is
+            # rooted at the site root ("static/js/" + id ...)
+        else:
+            root = origin + "/" + public
+        for m in WEBPACK_CHUNK_RE.finditer(text):
+            prefix, sep, hashes, suffix = m.group(1), m.group(2), m.group(3), m.group(4)
+            names = {}
+            nm = WEBPACK_NAMES_RE.search(m.group(0))
+            if nm:
+                names = dict(CHUNK_PAIR_RE.findall(nm.group(1)))
+            pairs = CHUNK_PAIR_RE.findall(hashes)
+            if not pairs:
+                continue
+            if prefix.startswith("/"):
+                stem = origin + prefix
+            elif prefix.startswith(("static/", "_next/")) and public in ("", "auto", "./"):
+                stem = origin + "/" + ("_next/" if "/_next/" in base_url and prefix.startswith("static/") else "") + prefix
+            else:
+                stem = urljoin(root, prefix)
+            for cid, h in pairs[:400]:
+                url = f"{stem}{names.get(cid, cid)}{sep}{h}{suffix}"
+                self.js_files.add(url)
+                r = self.asset_request(url, "js", priority=42)
+                if r:
+                    out.append(r)
+                    self.stats["webpack_chunks"] = self.stats.get("webpack_chunks", 0) + 1
+        return out
+
+    def parse_build_manifest(self, response, kind="json"):
+        """CRA asset-manifest.json, Vite .vite/manifest.json and Next.js
+        _buildManifest.js: every JS chunk, and (Next) every page route."""
+        self.stats["assets_fetched"] += 1
+        body = response.body
+        if response.status >= 400 or not body or body[:200].lstrip().lower().startswith((b"<!doctype", b"<html")):
+            return
+        text = body.decode("utf-8", "ignore")
+        origin = f"{urlparse(response.url).scheme}://{urlparse(response.url).netloc}"
+        self.scan(text, response.url, "json" if kind == "json" else "js")
+        files, routes = set(), set()
+        if response.url.endswith((".js",)):
+            # Next.js: self.__BUILD_MANIFEST = {"/about": ["static/chunks/pages/about-123.js"], ...}
+            routes.update(re.findall(r"""["'](/[A-Za-z0-9_./\[\]-]*)["']\s*:\s*\[""", text))
+            files.update("/_next/" + f for f in re.findall(r"""["'](static/[\w./\[\]%-]+\.js)["']""", text))
+        else:
+            d = _json(text)
+            if isinstance(d, dict):
+                if isinstance(d.get("files"), dict):  # CRA
+                    files.update(v for v in d["files"].values() if isinstance(v, str))
+                    files.update(v for v in d.get("entrypoints", []) if isinstance(v, str))
+                else:  # Vite: {"src/main.ts": {"file": "assets/main-abc.js", "imports": [...]}}
+                    for v in d.values():
+                        if isinstance(v, dict) and isinstance(v.get("file"), str):
+                            files.add(v["file"])
+                            files.update(x for x in v.get("dynamicImports", []) if isinstance(x, str) and x.endswith(".js"))
+                if d.get("start_url") and isinstance(d.get("start_url"), str):  # web app manifest
+                    routes.add(d["start_url"])
+        for f in sorted(files)[:800]:
+            if not f.endswith((".js", ".mjs", ".json", ".map")):
+                continue
+            url = urljoin(origin + "/", f.lstrip("./")) if not f.startswith("http") else f
+            self.js_files.add(url)
+            r = self.asset_request(url, "map" if f.endswith(".map") else "js", priority=44)
+            if r:
+                yield r
+        for route in sorted(routes)[:300]:
+            if "[" in route or route.startswith("/_"):
+                continue  # dynamic segment or internal page
+            r = self.page_request(origin + route, None, priority=-15, source="manifest")
+            if r:
+                yield r
 
     def _inline_sourcemap(self, data_uri, js_url):
         import base64
@@ -595,8 +891,9 @@ class TargetSpider(scrapy.Spider):
             line = line.split("#", 1)[0].strip()
             low = line.lower()
             if low.startswith("sitemap:"):
-                r = scrapy.Request(urljoin(response.url, line.split(":", 1)[1].strip()), callback=self.parse_sitemap, errback=self.on_error, priority=-50, meta={"sitemap_level": 0})
-                yield r
+                r = self.sitemap_request(urljoin(response.url, line.split(":", 1)[1].strip()), 0)
+                if r:
+                    yield r
             elif low.startswith(("disallow:", "allow:")):
                 path = line.split(":", 1)[1].strip()
                 if path and path != "/" and "*" not in path and "$" not in path:
@@ -604,6 +901,14 @@ class TargetSpider(scrapy.Spider):
                     r = self.page_request(base + path, response, priority=-5, source="robots")
                     if r:
                         yield r
+
+    def sitemap_request(self, url, level):
+        if not url.startswith(("http://", "https://")) or url in self.seen_sitemaps or len(self.seen_sitemaps) >= 60:
+            return None
+        if not self.scope.asset_ok(urlparse(url).hostname):
+            return None
+        self.seen_sitemaps.add(url)
+        return scrapy.Request(url, callback=self.parse_sitemap, errback=self.on_error, priority=-50 - level * 10, dont_filter=True, meta={"sitemap_level": level, "download_maxsize": 30_000_000})
 
     def parse_sitemap(self, response):
         if response.status >= 400:
@@ -624,8 +929,12 @@ class TargetSpider(scrapy.Spider):
         if "<sitemapindex" in text:
             if level >= 2:
                 return
-            for loc in locs[:10]:
-                yield scrapy.Request(loc.strip(), callback=self.parse_sitemap, errback=self.on_error, priority=-60, meta={"sitemap_level": level + 1})
+            # Prefer page/post sitemaps over image/video/tag ones
+            locs = sorted(locs, key=lambda u: bool(re.search(r"(?i)image|video|tag|author|attachment", u)))
+            for loc in locs[:25]:
+                r = self.sitemap_request(loc.strip(), level + 1)
+                if r:
+                    yield r
             return
         for loc in locs:
             self.stats["sitemap_urls"] += 1
@@ -637,59 +946,88 @@ class TargetSpider(scrapy.Spider):
     def parse_baseline(self, response):
         self.soft404 = (response.status, len(response.body), sha1(response.body))
         base = response.meta["base"]
-        for path in PROBE_PATHS:
-            yield scrapy.Request(base + path, callback=self.parse_probe, errback=self.on_error, priority=800, meta={"depth": 1, "probe": path, "dont_redirect": True, "handle_httpstatus_list": [200]})
+        for path, check, sev, title in PROBES:
+            yield scrapy.Request(
+                base + path, callback=self.parse_probe, errback=self.on_error, priority=800,
+                meta={"depth": 1, "probe": (path, check, sev, title), "dont_redirect": True, "handle_httpstatus_list": [200], "download_maxsize": 5_000_000},
+            )
+
+    def _is_soft404(self, body):
+        if not self.soft404:
+            return False
+        st, ln, h = self.soft404
+        return sha1(body) == h or (st == 200 and abs(len(body) - ln) <= max(32, ln * 0.03))
 
     def parse_probe(self, response):
-        if response.status != 200 or not response.body or is_binary(response.body):
-            return
-        path = response.meta["probe"]
+        path, check, sev, title = response.meta["probe"]
         body = response.body
-        if self.soft404 and (sha1(body) == self.soft404[2] or (self.soft404[0] == 200 and abs(len(body) - self.soft404[1]) <= max(32, self.soft404[1] * 0.03))):
+        if response.status != 200 or not body or self._is_soft404(body):
+            return
+        if is_binary(body) and path not in BINARY_PROBES:
             return
         text = body.decode("utf-8", "ignore")
-        head = text[:300].lstrip().lower()
-        is_html = head.startswith(("<!doctype", "<html", "<head", "<body"))
-        ok = False
-        if path.startswith("/.env") or path.endswith("/.env"):
-            ok = not is_html and len(ENV_LINE_RE.findall(text)) >= 1 and re.search(r"(?m)^[A-Z_][A-Z0-9_]*=", text) is not None
-        elif path == "/.git/config":
-            ok = "[core]" in text
-        elif path == "/.aws/credentials":
-            ok = "aws_access_key_id" in text.lower()
-        elif path == "/.htpasswd":
-            ok = re.search(r"(?m)^[^:\s]+:\$?[\w./$]{10,}", text) is not None
-        elif path == "/.npmrc":
-            ok = "registry" in text or "_auth" in text
-        elif path.endswith(".json"):
-            try:
-                ok = isinstance(json.loads(text), (dict, list)) and not is_html
-            except ValueError:
-                ok = False
-        elif path.endswith((".yml", ".yaml")):
-            ok = not is_html and "services:" in text
-        elif path == "/web.config":
-            ok = "<configuration" in text.lower()
-        elif path.endswith(".js"):
-            ok = not is_html and ("=" in text or ":" in text)
-        elif "wp-config" in path or path.endswith((".bak", ".old", "~")):
-            ok = "DB_PASSWORD" in text or "<?php" in text
-        elif path == "/phpinfo.php":
-            ok = "phpinfo()" in text or "PHP Version" in text
-        elif path == "/server-status":
-            ok = "Apache Server Status" in text
+        is_html = text[:300].lstrip().lower().startswith(("<!doctype", "<html", "<head", "<body"))
+        try:
+            ok = check(text, body, is_html)
+        except (ValueError, TypeError, AttributeError, IndexError, KeyError):
+            ok = False
         if not ok:
             return
         self.stats["probes_hit"] += 1
-        sev = next((s for k, s in PROBE_SEVERITY.items() if k in path), "medium")
-        self.record([{
-            "rule": "exposed_file", "title": f"Exposed sensitive file {path}", "category": "exposure",
-            "severity": sev, "confidence": "high", "value": response.url, "url": response.url,
-            "source": "probe", "context": re.sub(r"\s+", " ", text[:160]), "reasons": ["content_validated", "not_soft_404"],
-        }])
-        self.scan(text, response.url, "probe")
-        if path.endswith((".js", ".json")):
+        extra = self._probe_extra(path, text, response.url, body)
+        f = {
+            "rule": "exposed_file" if sev != "info" else "public_config", "title": f"{title}: {urlparse(response.url).path}",
+            "category": "exposure", "severity": sev, "confidence": "high", "value": response.url, "url": response.url,
+            "source": "probe", "context": re.sub(r"\s+", " ", text[:160]) if path not in BINARY_PROBES else "",
+            "reasons": ["content_validated", "not_soft_404"],
+        }
+        if extra:
+            f["extra"] = extra
+        self.record([f])
+        if path not in BINARY_PROBES:
+            self.scan(text, response.url, "probe")
+        if path.endswith((".js", ".json")) or _json(text) is not None:
             yield from self.discover_in_js(text, response.url)
+        if "graphql" in path:
+            q = "%7B__schema%7BqueryType%7Bname%7DmutationType%7Bname%7Dtypes%7Bname%7D%7D%7D"
+            yield scrapy.Request(response.url.split("?", 1)[0] + "?query=" + q, callback=self.parse_introspection, errback=self.on_error, priority=790, dont_filter=True, meta={"depth": 1, "handle_httpstatus_list": [200, 400]})
+
+    def _probe_extra(self, path, text, url, body=b""):
+        if path.startswith(("/swagger", "/openapi", "/api", "/v2/api-docs", "/v3/api-docs")) and _spec_ok(text, b"", False):
+            d = _json(text)
+            base = ""
+            if isinstance(d.get("servers"), list) and d["servers"] and isinstance(d["servers"][0], dict):
+                base = str(d["servers"][0].get("url", "")).rstrip("/")
+            elif d.get("basePath"):
+                base = str(d["basePath"]).rstrip("/")
+            paths = list(d["paths"].keys())
+            for p in paths[:2000]:
+                self.endpoints.add((base + p)[:300])
+            info = d.get("info") if isinstance(d.get("info"), dict) else {}
+            return {"title": info.get("title"), "version": info.get("version"), "path_count": len(paths), "sample_paths": paths[:15]}
+        if path == "/wp-json/wp/v2/users":
+            users = _json(text) or []
+            return {"users": [u.get("slug") for u in users[:50] if isinstance(u, dict)]}
+        if path == "/.DS_Store" and body:
+            names = sorted({m.group(1).decode("utf-16-be", "ignore") for m in DS_STORE_ENTRY_RE.finditer(body)})
+            for n in names[:200]:
+                if n and "/" not in n and not n.startswith("."):
+                    self.endpoints.add(urlparse(url).path.rsplit("/", 1)[0] + "/" + n)
+            return {"entries": names[:100]} if names else None
+        return None
+
+    def parse_introspection(self, response):
+        d = _json(response.text) if response.status == 200 else None
+        schema = ((d or {}).get("data") or {}).get("__schema") if isinstance(d, dict) else None
+        if not schema:
+            return
+        types = [t.get("name") for t in schema.get("types") or [] if isinstance(t, dict) and not str(t.get("name", "")).startswith("__")]
+        self.record([{
+            "rule": "graphql_introspection", "title": "GraphQL introspection enabled", "category": "exposure",
+            "severity": "medium", "confidence": "high", "value": response.url.split("?", 1)[0], "url": response.url,
+            "source": "probe", "context": f"{len(types)} types; mutations: {bool(schema.get('mutationType'))}",
+            "reasons": ["introspection_query_answered"], "extra": {"type_count": len(types), "sample_types": types[:30], "has_mutations": bool(schema.get("mutationType"))},
+        }])
 
     # ---------------------------------------------------------------- status
     def status(self):

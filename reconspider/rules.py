@@ -126,6 +126,9 @@ def v_jwt(value, ctx):
         return out
     if str(header.get("alg", "")).lower() == "none":
         out["reasons"].append("alg_none")
+    if str(payload.get("sub")) in {"123456", "12345", "1"} and not payload.get("iss"):
+        out.update(severity="info", confidence="low")
+        out["reasons"].append("placeholder_claims")
     exp = payload.get("exp")
     if isinstance(exp, str) and exp.isdigit():
         exp = int(exp)
@@ -521,6 +524,56 @@ RULES = [
         severity="high",
     ),
     # ----------------------------------------------------------------- observability / SaaS
+    Rule(
+        "datadog_client_token",
+        "Datadog RUM client token",
+        R(r"\b(?P<v>pub[0-9a-f]{32})\b"),
+        ("pub",),
+        severity="info",
+        public=True,
+        note="Browser RUM/log-intake token, public by design. It can only submit telemetry.",
+    ),
+    Rule(
+        "datadog_api_key",
+        "Datadog API / application key",
+        R(
+            r"(?i)(?:dd|datadog)[\w.-]{0,12}(?P<kind>api|app(?:lication)?)[_-]?key[\"'`]?\s*(?:[:=]|=>)\s*[\"'`]?"
+            r"(?P<v>[0-9a-f]{32}|[0-9a-f]{40})(?![0-9a-f])"
+        ),
+        ("datadog", "dd_", "dd-", "ddapi", "ddapp"),
+        severity="critical",
+    ),
+    Rule(
+        "sentry_dsn",
+        "Sentry DSN",
+        R(r"(?P<v>https://[0-9a-f]{32}@(?:o\d+\.)?ingest(?:\.[a-z]{2})?\.sentry\.io/\d+)"),
+        ("ingest",),
+        severity="info",
+        public=True,
+        note="Public by design. Reveals the org/project ID only.",
+    ),
+    Rule(
+        "firebase_database_url",
+        "Firebase Realtime Database URL",
+        R(r"(?P<v>https://[a-z0-9-]+(?:-default-rtdb)?\.(?:firebaseio\.com|[a-z0-9-]+\.firebasedatabase\.app))"),
+        ("firebaseio.com", "firebasedatabase.app"),
+        severity="info",
+        category="cloud",
+        note="Firebase database referenced by the site.",
+    ),
+    Rule(
+        "cloud_bucket_url",
+        "Cloud storage bucket",
+        R(
+            r"(?P<v>https?://(?:[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]\.s3(?:[.-][a-z0-9-]+)?\.amazonaws\.com|s3(?:[.-][a-z0-9-]+)?\.amazonaws\.com/[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]"
+            r"|storage\.googleapis\.com/[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]|[a-z0-9]{3,24}\.blob\.core\.windows\.net/[a-z0-9-]{3,63}"
+            r"|[a-z0-9-]+\.firebasestorage\.app|firebasestorage\.googleapis\.com/v0/b/[a-z0-9._-]+))"
+        ),
+        ("amazonaws.com", "storage.googleapis.com", "blob.core.windows.net", "firebasestorage"),
+        severity="info",
+        category="cloud",
+        note="Cloud storage referenced by the site.",
+    ),
     Rule(
         "newrelic_user_key",
         "New Relic user API key",

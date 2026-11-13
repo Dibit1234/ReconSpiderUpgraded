@@ -76,7 +76,7 @@ def normalize_target(raw):
     return (t if p.path else t + "/"), assumed
 
 
-def load_targets(args):
+def load_targets(args, merge=True):
     raw = list(args.targets or [])
     for path in args.list or []:
         fh = sys.stdin if path == "-" else open(path, encoding="utf-8")
@@ -85,7 +85,13 @@ def load_targets(args):
     if "-" in raw:
         raw.remove("-")
         raw.extend(sys.stdin.read().splitlines())
-    seen, out = set(), []
+    """Return [(primary_url, scheme_assumed, [extra seed urls])].
+
+    URLs on the same host (ignoring www.) and port become ONE target with
+    several seed pages, so a list of 30 landing pages on one site is crawled
+    once and each finding is reported once.
+    """
+    groups, order = {}, []
     for r in raw:
         nt = normalize_target(r)
         if not nt:
@@ -95,12 +101,19 @@ def load_targets(args):
         t, assumed = nt
         p = urlparse(t)
         host = (p.hostname or "").lower()
-        key = (host[4:] if host.startswith("www.") else host, p.port, p.path.rstrip("/") or "/")
-        if key in seen:
+        bare = host[4:] if host.startswith("www.") else host
+        key = (bare, p.port) if merge else (bare, p.port, p.path.rstrip("/") or "/", p.query)
+        g = groups.get(key)
+        if g is None:
+            groups[key] = g = {"primary": t, "assumed": assumed, "seeds": [], "seen": {p.path.rstrip("/") + "?" + p.query}}
+            order.append(key)
             continue
-        seen.add(key)
-        out.append((t, assumed))
-    return out
+        sig = p.path.rstrip("/") + "?" + p.query
+        if sig in g["seen"]:
+            continue
+        g["seen"].add(sig)
+        g["seeds"].append(t)
+    return [(groups[k]["primary"], groups[k]["assumed"], groups[k]["seeds"]) for k in order]
 
 
 # --------------------------------------------------------------------------- #
@@ -124,14 +137,16 @@ def build_parser():
     g.add_argument("--max-depth", type=int, default=4, help="Max link depth from the start page")
     g.add_argument("--max-time", type=int, default=300, help="Hard time limit per target in seconds (0 = none)")
     g.add_argument("--max-per-template", type=int, default=8, help="Max pages per URL template (/blog/{slug}, /item/{n}) - stops spider traps")
-    g.add_argument("--include-subdomains", action="store_true", help="Also crawl pages on other subdomains of the target's domain")
+    g.add_argument("--include-subdomains", action="store_true", help="Also crawl other subdomains of the target's domain that are linked or referenced in JS")
+    g.add_argument("--max-subdomains", type=int, default=15, help="With --include-subdomains: max extra subdomains seeded per target")
+    g.add_argument("--no-merge-hosts", action="store_true", help="Crawl each listed URL as its own target even when several share a host")
     g.add_argument("--no-seed", dest="seed", action="store_false", help="Don't seed the crawl from robots.txt and sitemap.xml")
     g.add_argument("--max-text-bytes", type=int, default=3_000_000, help="Max HTML page size to download")
     g.add_argument("--max-asset-bytes", type=int, default=8_000_000, help="Max JS/JSON size to download")
     g.add_argument("--max-map-bytes", type=int, default=25_000_000, help="Max sourcemap size to download")
 
     g = p.add_argument_group("discovery extras")
-    g.add_argument("--probe", action="store_true", help="Request a curated list of commonly exposed files (/.env, /.git/config, /config.json, ...) with soft-404 detection")
+    g.add_argument("--probe", action="store_true", help="Request commonly exposed files and APIs (/.env, /.git, OpenAPI/Swagger, GraphQL, Spring actuator, WP users, config endpoints) with soft-404 detection")
     g.add_argument("--probe-sourcemaps", action="store_true", help="Request <script>.map for first-party JS even when not referenced")
     g.add_argument("--include-vendor", action="store_true", help="Also scan node_modules/vendor sources inside sourcemaps")
 
@@ -186,7 +201,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.llm and not args.llm_model:
         parser.error("--llm-model is required when --llm is provided")
-    targets = load_targets(args)
+    targets = load_targets(args, merge=not args.no_merge_hosts)
     if not targets:
         parser.error("no targets given (positional, -l FILE, or - for stdin)")
 
@@ -217,6 +232,7 @@ def main(argv=None):
         max_per_template=max(1, args.max_per_template), include_subdomains=args.include_subdomains, seed=args.seed,
         max_text_bytes=args.max_text_bytes, max_asset_bytes=args.max_asset_bytes, max_map_bytes=args.max_map_bytes,
         probe=args.probe, probe_sourcemaps=args.probe_sourcemaps, include_vendor=args.include_vendor,
+        max_subdomains=max(0, args.max_subdomains),
         entropy=args.entropy, signatures=args.signatures, ignore_patterns=ignore, suppress_values=suppress,
         redact=args.redact, include_urls=args.include_urls, include_comments=args.include_comments,
     )
@@ -281,7 +297,13 @@ def run(targets, opts, args, headers, out_dir):
     stream = None if args.no_stream_findings else open(os.path.join(out_dir, "findings.jsonl"), "w", encoding="utf-8")
     from .output import prepare
 
+    streamed = set()
+
     def sink(spider, finding):
+        key = (finding["rule"], finding["value"])
+        if key in streamed:
+            return  # same finding already written for another target
+        streamed.add(key)
         if stream:
             row = prepare([finding], opts.redact)[0]
             row = {k: v for k, v in row.items() if k not in {"occurrences", "locations"}}
@@ -330,9 +352,9 @@ def run(targets, opts, args, headers, out_dir):
     def crawl_one(target):
         if state["stopping"]:
             return defer.succeed(None)
-        url, assumed = target
+        url, assumed, seeds = target
         crawler = process.create_crawler(TargetSpider)
-        d = process.crawl(crawler, target=url, opts=opts, sink=sink, scheme_assumed=assumed)
+        d = process.crawl(crawler, target=url, opts=opts, sink=sink, scheme_assumed=assumed, extra_seeds=seeds)
         # spider exists once crawl() has started
         reactor.callLater(0, lambda: state["active"].append(crawler.spider) if getattr(crawler, "spider", None) else None)
         d.addBoth(finish_target, crawler)
@@ -395,7 +417,16 @@ def run(targets, opts, args, headers, out_dir):
             write_target(out_dir, res)
             print(f"  {res['target']}: checked={st['checked']} kept={st['yes']} dropped={st['no']} errors={st['errors']}")
 
-    summary = write_summary(out_dir, results, started, opts)
+    from .domains import inventory, lookalike_findings
+
+    extra = lookalike_findings(results)
+    inv = inventory(results)
+    summary = write_summary(out_dir, results, started, opts, extra_findings=extra, inventory=inv)
+    if inv["shared_bundles"]:
+        top = inv["shared_bundles"][0]
+        print(f"Shared build: {top[0]} served by {len(top[1])} hosts (see report.md)")
+    if inv["subdomains"]:
+        print(f"Discovered {len(inv['subdomains'])} other host(s) on target domains (summary.json -> inventory.subdomains)")
     print()
     print(color("Findings", "bold"), f"(≥{args.min_severity}; everything is in {out_dir}/summary.json and report.md)")
     print_findings_table(summary["findings"], min_sev=args.min_severity)

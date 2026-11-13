@@ -195,3 +195,131 @@ def test_url_helpers():
     assert template_of("https://acme.com/about") != template_of("https://acme.com/contact")
     assert looks_trap("https://acme.com/a/b/a/b/a/b/c")
     assert not looks_trap("https://acme.com/docs/a/b/c")
+
+
+# ================================================================ v4.1: real-world FP shapes
+def test_datadog_rum_token_is_public_but_api_key_is_not():
+    rum = scan(f'DD_RUM.init({{ clientToken: "{fx.P["dd_rum"]}", applicationId: "3816bfdf-6698-4c50-aafa-f16770d1a433" }})', "inline_js")
+    assert [(f["rule"], f["severity"]) for f in rum] == [("datadog_client_token", "info")]
+    api = scan(f'var m = {{ datadog_api_key: "{fx.S["dd_api"]}" }}')
+    assert any(f["rule"] == "datadog_api_key" and f["severity"] == "critical" for f in api)
+
+
+def test_scheme_as_username_is_not_credentials():
+    fs = scan('<a href="http://mailto:dareenquiries@seniors.com.au">x</a>', "html")
+    assert [f["rule"] for f in fs] == ["email"]
+
+
+def test_header_only_and_truncated_jwt_rejected():
+    for v in ("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9", "eyJhbGciOiJIUzI1Ni"):
+        assert shown(scan(f'{{"access_token":"{v}","token_type":"bearer"}}')) == []
+
+
+def test_mock_bundle_downgraded_and_flagged():
+    fs = scan(fx.MSW_BUNDLE, "js", url="https://acme.com/static/js/browser-D74W5xup.js")
+    assert [f["rule"] for f in shown(fs)] == ["mock_api_handlers"]
+    assert {f["value"] for f in fs if f["severity"] == "info"} >= {"kag0Uk2wvbMTOPi", "10.10.10.10"}
+
+
+def test_placeholder_context_downgrades_generic():
+    fs = scan('le.json({ClientID:12345678,QuoteID:87654321,EvolveUpdatePaymentDetailsToken:"kag0Uk2wvbMTOPi"})')
+    assert [(f["severity"], f["confidence"]) for f in fs] == [("low", "low")]
+
+
+def test_bulk_ip_list_collapsed():
+    fs = scan(fx.BLOCKLIST, "html", url="https://acme.com/downloads/blocklist.txt")
+    assert len(fs) == 1 and fs[0]["rule"] == "public_ip_list" and fs[0]["extra"]["count"] > 50
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ('{"h":"<a href=\\"mailto:info@acme.com.au\\u0022\\u003einfo@acme.com.au\\u003c/a\\u003e"} mailto:x%40acme.com', {"info@acme.com.au", "x@acme.com"}),
+        ("write to %20enquiries@oaic.gov.au today", {"enquiries@oaic.gov.au"}),
+        ("service@koganlifeinsurance.com.auyou can call", {"service@koganlifeinsurance.com.au"}),
+        ("hi sales@acme.comPlease reply", {"sales@acme.com"}),
+        ("team@acme.insurance and ops@acme.cafe", {"team@acme.insurance", "ops@acme.cafe"}),
+    ],
+)
+def test_email_cleanup(text, expected):
+    assert values(scan(text, "html")) == expected
+
+
+# ================================================================ v4.1: run-level analysis
+def test_one_edit_distance():
+    from reconspider.domains import _one_edit
+
+    assert _one_edit("realifecover", "reallifecover")
+    assert _one_edit("acme-crop", "acme-corp")
+    assert _one_edit("acmecorp", "acmecorq")
+    assert not _one_edit("seniors", "nzseniors")
+    assert not _one_edit("acme", "acme")
+
+
+def test_lookalike_needs_established_counterpart():
+    from reconspider.domains import lookalike_findings
+
+    def res(emails):
+        return [{"target": "https://t/", "findings": [{"rule": "email", "value": e, "url": "https://t/p", "locations": ["https://t/p"]} for e in emails], "discovered_hosts": [], "external_hosts": {}}]
+
+    hits = lookalike_findings(res(["a@reallifecover.com.au", "b@reallifecover.com.au", "c@reallifecover.com.au", "s@realifecover.com.au"]))
+    assert [(f["value"], f["extra"]["likely_intended"]) for f in hits] == [("realifecover.com.au", "reallifecover.com.au")]
+    assert lookalike_findings(res(["a@realifecover.com.au", "b@reallifecover.com.au"])) == []
+
+
+def test_target_list_merges_same_host():
+    from types import SimpleNamespace
+
+    from reconspider.cli import load_targets
+
+    args = SimpleNamespace(targets=["https://a.com/x", "https://www.a.com/y", "a.com/x", "https://b.com/", "https://a.com:8443/"], list=None)
+    got = load_targets(args)
+    assert [(u, seeds) for u, _, seeds in got] == [("https://a.com/x", ["https://www.a.com/y"]), ("https://b.com/", []), ("https://a.com:8443/", [])]
+    assert len(load_targets(args, merge=False)) == 4
+
+
+# ================================================================ v4.1: discovery
+def _spider(target="https://acme.com/", **over):
+    from types import SimpleNamespace
+
+    from reconspider.crawl import TargetSpider
+
+    o = dict(include_subdomains=False, max_subdomains=15, entropy=False, signatures=True, ignore_patterns=[], suppress_values=[],
+             max_assets=400, max_pages=300, max_depth=4, max_per_template=8, max_text_bytes=10**6, max_asset_bytes=10**6,
+             max_map_bytes=10**6, probe=False, seed=True, probe_sourcemaps=False, include_vendor=False)
+    o.update(over)
+    return TargetSpider(target, SimpleNamespace(**o), sink=lambda s, f: None)
+
+
+def test_webpack_chunk_map_reconstruction():
+    sp = _spider()
+    urls = [r.url for r in sp.discover_in_js(fx.RUNTIME_JS, "https://acme.com/static/js/runtime.4c3b2a19.js")]
+    assert "https://acme.com/static/js/345.9f8e7d6c.chunk.js" in urls and "https://acme.com/static/js/346.aa00bb11.chunk.js" in urls
+    named = 'a.p="/_next/";a.u=function(e){return"static/chunks/"+({12:"framework",34:"main"}[e]||e)+"."+{12:"1a2b3c4d5e",34:"6f7a8b9c0d"}[e]+".js"}'
+    urls = [r.url for r in _spider().discover_in_js(named, "https://acme.com/_next/static/chunks/webpack-1.js")]
+    assert "https://acme.com/_next/static/chunks/framework.1a2b3c4d5e.js" in urls
+
+
+def test_host_inventory_and_subdomain_seeding():
+    sp = _spider(include_subdomains=True, max_subdomains=1)
+    js = 'fetch("https://api.acme.com/v1/x");var q="https://quote.uat.acme.com/";var cdn="https://cdn.vendor.net/a.js"'
+    sp.discover_in_js(js, "https://acme.com/static/js/app.js")
+    assert sp.discovered_hosts == {"api.acme.com", "quote.uat.acme.com"}
+    assert sp.external_refs == {"cdn.vendor.net": {"js_ref"}}
+    seeded = [r.url for r in sp.drain_subdomain_seeds()]
+    assert len(seeded) == 1  # capped by max_subdomains
+
+
+def test_html_hidden_links_regexes():
+    from reconspider.crawl import DATA_LINK_RE, JS_NAV_RE
+
+    html = '<div data-target-url="/offers"></div><button onclick="location.href=\'/quote\'">x</button><a data-href="/b">'
+    assert [m.group(1) for m in DATA_LINK_RE.finditer(html)] == ["/offers", "/b"]
+    assert [m.group(1) for m in JS_NAV_RE.finditer(html)] == ["/quote"]
+
+
+def test_template_collapse_for_product_slugs_and_wide_folders():
+    assert template_of("https://a.com/product/oak-chair-123") == template_of("https://a.com/product/red-lamp-77")
+    sp = _spider()
+    tpls = {sp.adaptive_template(template_of(f"https://acme.com/category/name{i}x")) for i in range(40)}
+    assert "acme.com/category/{var}?" in tpls and len(tpls) == 26

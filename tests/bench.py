@@ -106,6 +106,13 @@ def main():
         exp = dict(fx.TRUE_POSITIVES, **fx.PROBE_TRUE_POSITIVES)
         shown, allv, el, req, pages, data = run_new(args.port, wd, ["--probe"])
         report("NEW (--probe)", *score(shown, allv, exp), el, req, pages)
+        rules = {f["rule"] for f in data["findings"] if f["severity"] != "info"}
+        need = {"lookalike_domain", "mock_api_handlers", "graphql_introspection", "exposed_file", "datadog_api_key"}
+        print("required rules missing:", sorted(need - rules) or "none")
+        print("bulk IP list collapsed:", any(f["rule"] == "public_ip_list" for f in data["findings"]),
+              "| single public_ip rows:", sum(f["rule"] == "public_ip" for f in data["findings"]))
+        inv = data.get("inventory", {})
+        print("inventory:", {k: len(v) for k, v in inv.items()})
 
 
 if __name__ == "__main__":

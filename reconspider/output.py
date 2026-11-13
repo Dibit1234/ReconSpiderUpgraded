@@ -65,8 +65,11 @@ def target_result(spider, opts, reason):
         "stats": st,
         "filtered_candidates": dict(spider.det.rejections.most_common(40)),
         "findings": prepare(findings, opts.redact),
+        "start_urls": [spider.target] + list(spider.extra_seeds),
         "endpoints": sorted(spider.endpoints),
         "js_files": sorted(spider.js_files),
+        "discovered_hosts": sorted(spider.discovered_hosts),
+        "external_hosts": {h: sorted(k) for h, k in sorted(spider.external_refs.items())},
     }
     if opts.include_urls:
         res["crawled_urls"] = spider.crawled_urls
@@ -90,8 +93,34 @@ def write_target(out_dir, result):
     return d
 
 
-def write_summary(out_dir, results, started, opts):
-    all_f = [dict(f, target=r["target"]) for r in results for f in r["findings"]]
+def merge_across_targets(results, extra=None):
+    """One row per (rule, value) across all targets, with every target listed."""
+    merged = {}
+    for r in results:
+        for f in r["findings"]:
+            key = (f["rule"], f["value"])
+            cur = merged.get(key)
+            if cur is None:
+                cur = dict(f, target=r["target"], targets=[r["target"]])
+                cur["locations"] = list(f.get("locations") or [f["url"]])
+                merged[key] = cur
+                continue
+            if r["target"] not in cur["targets"]:
+                cur["targets"].append(r["target"])
+            cur["occurrences"] = cur.get("occurrences", 1) + f.get("occurrences", 1)
+            for loc in f.get("locations") or [f["url"]]:
+                if loc not in cur["locations"] and len(cur["locations"]) < 5:
+                    cur["locations"].append(loc)
+            # keep the strongest classification seen
+            if SEVERITY_RANK.get(f["severity"], 9) < SEVERITY_RANK.get(cur["severity"], 9):
+                cur.update(severity=f["severity"], confidence=f["confidence"], title=f["title"])
+    for f in extra or []:
+        merged.setdefault((f["rule"], f["value"]), f)
+    return list(merged.values())
+
+
+def write_summary(out_dir, results, started, opts, extra_findings=None, inventory=None):
+    all_f = merge_across_targets(results, extra_findings)
     by_sev, by_cat = counts(all_f)
     summary = {
         "started": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(started)),
@@ -115,6 +144,8 @@ def write_summary(out_dir, results, started, opts):
         "by_category": by_cat,
         "findings": sorted(all_f, key=sort_key),
     }
+    if inventory:
+        summary["inventory"] = inventory
     write_json(os.path.join(out_dir, "summary.json"), summary)
     write_markdown(os.path.join(out_dir, "report.md"), summary)
     return summary
@@ -136,9 +167,19 @@ def write_markdown(path, summary):
             continue
         lines += ["", f"## {sev.capitalize()} ({len(items)})", "", "| Finding | Value | Confidence | Where | Target |", "|---|---|---|---|---|"]
         for f in items[:500]:
+            tg = f.get("targets") or [f.get("target", "")]
+            tgt = tg[0] + (f" (+{len(tg) - 1} more)" if len(tg) > 1 else "")
             lines.append(
-                f"| {_md_escape(f['title'])} | `{_md_escape(f['value'][:90])}` | {f['confidence']} | {_md_escape(f['url'][:100])} | {_md_escape(f['target'])} |"
+                f"| {_md_escape(f['title'])} | `{_md_escape(f['value'][:90])}` | {f['confidence']} | {_md_escape(f['url'][:100])} | {_md_escape(tgt)} |"
             )
+    inv = summary.get("inventory") or {}
+    if inv.get("subdomains"):
+        lines += ["", f"## Discovered hosts on target domains ({len(inv['subdomains'])})", ""]
+        lines += [f"- {h}" for h in inv["subdomains"][:300]]
+    if inv.get("shared_bundles"):
+        lines += ["", "## Identical JS bundles served by several targets", "", "Same build on several hosts: a vulnerability in one likely affects all of them.", ""]
+        for name, hosts in inv["shared_bundles"][:50]:
+            lines.append(f"- `{name}`: {', '.join(hosts[:12])}")
     with open(path, "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines) + "\n")
 

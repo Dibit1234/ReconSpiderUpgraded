@@ -254,6 +254,11 @@ def value_rejection(value, kind, key=""):
     v = value.strip()
     if not v:
         return "empty"
+    if v.startswith("eyJ") and v.count(".") < 2:
+        # JWT header alone ({"alg":"HS256","typ":"JWT"}) or a truncated token:
+        # no payload/signature, so nothing usable. Full JWTs are handled by
+        # the jwt rule.
+        return "jwt_fragment"
     low = v.lower()
     if _PLACEHOLDER_FULL.match(v) and not (kind == "password" and low in {"admin", "root", "guest", "letmein", "qwerty"}):
         # Default creds like admin/root are real findings for a password key.
@@ -356,6 +361,19 @@ BTOA_RE = re.compile(r"btoa\(\s*[\"'`](?P<user>[^\"'`:]{1,64}):(?P<pw>[^\"'`]{1,
 QUOTED_B64_40 = re.compile(r"[\"'`](?P<v>[A-Za-z0-9/+]{40})[\"'`]")
 HIGH_ENTROPY_LITERAL = re.compile(r"[\"'`](?P<v>[A-Za-z0-9_+/=.\-]{20,200})[\"'`]")
 
+URI_SCHEMES_AS_USER = {"mailto", "tel", "sms", "callto", "http", "https", "ftp", "javascript", "data", "file", "skype", "whatsapp", "viber", "maps", "geo"}
+
+# Mock / fixture code shipped to the browser (MSW, Mirage, axios-mock-adapter).
+# Values inside are test data, but the file itself maps the real API.
+MOCK_FILE_RE = re.compile(
+    r"\[MSW\]|mockServiceWorker|setupWorker\s*\(|msw/browser|from\s*[\"']msw[\"']|miragejs|"
+    r"new\s+MockAdapter\s*\(|createServer\(\{\s*routes|__MOCKS__|mock-service-worker"
+)
+PLACEHOLDER_CTX_RE = re.compile(
+    r"(?i)(?<![\w.])(?:123456(?:7|78|789|7890)?|87654321|1234567890|0{8,}|1{8,}|9{8,}|11223344)(?![\w.])|"
+    r"\b(?:mock(?:ed|s)?|dummy|fake|fixture|stub(?:bed)?|lorem|placeholder)\b"
+)
+
 DB_SCHEMES = {
     "postgres", "postgresql", "mysql", "mariadb", "mongodb", "mongodb+srv", "redis", "rediss",
     "amqp", "amqps", "mssql", "sqlserver", "oracle", "ftp", "ftps", "sftp", "smtp", "smtps",
@@ -417,6 +435,43 @@ PLACEHOLDER_EMAIL_LOCALS = {
 }
 
 
+EMAIL_FULL_RE = re.compile(r"[a-z0-9][a-z0-9._%+-]{0,63}@(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}")
+KNOWN_TLDS = {
+    "com", "net", "org", "info", "biz", "edu", "gov", "mil", "int", "io", "co", "ai", "app", "dev", "xyz",
+    "online", "site", "tech", "store", "shop", "cloud", "company", "agency", "email", "group", "insurance",
+    "bank", "health", "finance", "financial", "solutions", "services", "digital", "media", "global", "world",
+    "life", "live", "news", "blog", "pro", "name", "mobi", "asia", "travel", "jobs", "museum", "aero", "coop",
+    "community", "network", "systems", "software", "consulting", "partners", "capital", "legal", "law",
+    "care", "clinic", "dental", "realty", "properties", "homes", "energy", "studio", "design", "marketing",
+    "academy", "school", "university", "education", "foundation", "charity", "church", "events", "today",
+    "support", "center", "centre", "technology", "security", "works", "zone", "space", "website", "page",
+    "plus", "one", "top", "vip", "club", "fun", "art", "photo", "games", "money", "credit", "loans", "fund",
+    "tax", "accountants", "auto", "cars", "pet", "pets", "vet", "london", "sydney", "melbourne", "nyc", "berlin",
+}
+_TLD_GLUE_PREFIXES = ("com", "net", "org", "edu", "gov", "info", "biz")
+
+
+def repair_email_domain(domain):
+    """Return a cleaned domain, or None if the TLD is clearly bogus.
+
+    Text with a missing space glues the next word onto the TLD:
+    "service@acme.com.auyou can" -> "acme.com.au", "a@b.comPlease" -> "b.com".
+    """
+    labels = domain.split(".")
+    tld = labels[-1]
+    if len(tld) == 2 or tld in KNOWN_TLDS:
+        return domain
+    second = labels[-2] if len(labels) >= 3 else ""
+    if second in {"com", "net", "org", "co", "gov", "edu", "ac", "asn", "id", "ltd", "or", "ne", "go"} and len(tld) > 2:
+        return ".".join(labels[:-1] + [tld[:2]])
+    for p in _TLD_GLUE_PREFIXES:
+        if tld.startswith(p) and len(tld) > len(p):
+            return ".".join(labels[:-1] + [p])
+    if len(tld) <= 6:
+        return domain  # long tail of real gTLDs (.cafe, .codes ...)
+    return None
+
+
 def _registrable(host):
     host = (host or "").lower().strip(".").strip("[]")
     try:
@@ -473,7 +528,37 @@ class Detector:
         alt = decoded_variant(text)
         if alt:
             self._scan_once(alt, url, source, findings)
-        return self._finalize(findings)
+        out = self._finalize(findings)
+        mock = source in {"js", "inline_js", "sourcemap", "json"} and MOCK_FILE_RE.search(text) is not None
+        return self._apply_context(out, mock, url, source)
+
+    def _apply_context(self, findings, mock, url, source):
+        weak = {"generic_password", "generic_secret", "bearer_header", "high_entropy_string", "username", "internal_ip", "url_credentials", "basic_auth_header", "basic_auth_btoa"}
+        for f in findings:
+            if f.get("public") or f["severity"] == "info":
+                continue
+            if mock:
+                if f["rule"] in weak:
+                    f.update(severity="info", confidence="low")
+                    f["reasons"].append("mock_handlers_file")
+                    self.rejections["downgraded:mock_file"] += 1
+                else:
+                    # A real-looking vendor key inside mocks is still worth a look.
+                    f["confidence"] = "medium"
+                    f["reasons"].append("in_mock_file")
+            elif f["rule"] in weak and PLACEHOLDER_CTX_RE.search(f.get("context", "")):
+                f.update(severity="low", confidence="low")
+                f["reasons"].append("placeholder_context")
+                self.rejections["downgraded:placeholder_ctx"] += 1
+        if mock:
+            findings.append(
+                self._mk(
+                    "mock_api_handlers", "Mock API handlers shipped to the browser", "low", "high", url, url, source,
+                    "", ["mock_framework_marker"], category="exposure",
+                    note="Test-only code in a deployed bundle. Its handlers list real API routes and response shapes; check whether production ships it too.",
+                )
+            )
+        return findings
 
     def scan_headers(self, headers, url=""):
         """headers: iterable of (name, value) str pairs."""
@@ -598,6 +683,10 @@ class Detector:
             return
         for start, end, scheme, user, pw, host in self._iter_url_creds(text):
             whole = text[start:end]
+            if user.lower() in URI_SCHEMES_AS_USER:
+                # href="http://mailto:x@y" / "https://tel:..." - broken link, not creds
+                self.rejections["url_creds_scheme_as_user"] += 1
+                continue
             if value_rejection(pw, "password") or (user.lower(), pw.lower()) in {("user", "pass"), ("user", "password"), ("username", "password"), ("admin", "admin")}:
                 self.rejections["url_creds_placeholder"] += 1
                 continue
@@ -758,6 +847,27 @@ class Detector:
             if f:
                 seen.add(cand)
                 out.append(f)
+        return self._collapse_ip_lists(out, url, source)
+
+    BULK_IP_THRESHOLD = 50
+
+    def _collapse_ip_lists(self, found, url, source):
+        """A document with dozens of IPs is an IP list (blocklist, allowlist,
+        CDN ranges): report it once, not thousands of times."""
+        out = []
+        for rule, title, sev in (("public_ip", "Bulk public IP list", "info"), ("internal_ip", "Bulk internal IP list", "low")):
+            group = [f for f in found if f["rule"] == rule]
+            if len(group) <= self.BULK_IP_THRESHOLD:
+                out.extend(group)
+                continue
+            self.rejections[f"ip:collapsed_{rule}"] += len(group)
+            sample = [f["value"] for f in group[:25]]
+            out.append(
+                self._mk(
+                    f"{rule}_list", f"{title} ({len(group)} addresses)", sev, "high", f"{url}#{rule}_list", url, source,
+                    " ".join(sample[:8]), [f"count={len(group)}"], category="ip", extra={"count": len(group), "sample": sample},
+                )
+            )
         return out
 
     @staticmethod
@@ -810,9 +920,17 @@ class Detector:
     # ------------------------------------------------------------ emails
     def _email_ok(self, email):
         email = email.strip(".").lower()
+        if not EMAIL_FULL_RE.fullmatch(email):
+            self.rejections["email:malformed"] += 1
+            return None
         local, _, domain = email.partition("@")
         if not local or "." not in domain:
             return None
+        domain = repair_email_domain(domain)
+        if domain is None:
+            self.rejections["email:bad_tld"] += 1
+            return None
+        email = f"{local}@{domain}"
         tld = domain.rsplit(".", 1)[-1]
         if tld in FILE_TLDS:
             self.rejections["email:file_tld"] += 1
@@ -856,7 +974,8 @@ class Detector:
             if dm:
                 lm = EMAIL_LOCAL_BACK.search(text, max(0, i - 64), i)
                 if lm:
-                    local = lm.group(0).lstrip("._%+-")
+                    # "%20enquiries@" (URL-encoded space) -> "enquiries@"
+                    local = re.sub(r"^(?:.*%[0-9a-fA-F]{2})", "", lm.group(0)).lstrip("._%+-")
                     ls = i - len(local)
                     if local and (ls == 0 or text[ls - 1] not in "\\/"):
                         add(f"{local}@{dm.group(0)}", "email_pattern", ls, dm.end())
@@ -865,7 +984,7 @@ class Detector:
             if "%40" in text:
                 from urllib.parse import unquote
 
-                for m in re.finditer(r"mailto:([^\"'\s>?]+)", text):
+                for m in re.finditer(r"mailto:([^\"'\s>?<&\\]+)", text):
                     for part in unquote(m.group(1)).split(","):
                         add(part.strip(), "mailto", m.start(), m.end())
         low = text.lower()
