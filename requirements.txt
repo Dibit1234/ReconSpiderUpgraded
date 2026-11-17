@@ -1,1 +1,5 @@
 scrapy>=2.11,<3.0
+# File analysis (--files): PDF text and legacy .xls tables. Optional; without
+# them those formats fall back to metadata only / string recovery.
+pypdf>=4.0
+xlrd>=2.0

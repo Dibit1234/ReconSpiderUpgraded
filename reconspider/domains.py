@@ -129,4 +129,16 @@ def inventory(results):
             if HASHED_BUNDLE_RE.search(name):
                 bundles[name].add(host)
     shared = sorted(((n, sorted(h)) for n, h in bundles.items() if len(h) >= 2), key=lambda x: (-len(x[1]), x[0]))
-    return {"subdomains": sorted(subs), "shared_bundles": shared}
+    docs = {}
+    for r in results:
+        for bucket, items in (r.get("file_inventory") or {}).items():
+            dst = docs.setdefault(bucket, {})
+            for value, info in items.items():
+                cur = dst.setdefault(value, {"count": 0, "files": []})
+                cur["count"] += info.get("count", 1)
+                for f in info.get("files", []):
+                    if f not in cur["files"] and len(cur["files"]) < 5:
+                        cur["files"].append(f)
+    docs = {k: dict(sorted(v.items(), key=lambda kv: -kv[1]["count"])) for k, v in docs.items() if v}
+    n_files = sum(len(r.get("files") or []) for r in results)
+    return {"subdomains": sorted(subs), "shared_bundles": shared, "documents": docs, "files_analyzed": n_files}

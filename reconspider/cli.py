@@ -150,6 +150,17 @@ def build_parser():
     g.add_argument("--probe-sourcemaps", action="store_true", help="Request <script>.map for first-party JS even when not referenced")
     g.add_argument("--include-vendor", action="store_true", help="Also scan node_modules/vendor sources inside sourcemaps")
 
+    g = p.add_argument_group("file analysis (downloads documents/images for offline parsing; nothing is executed)")
+    g.add_argument("--files", action="store_true", help="Download linked documents (PDF, Office, OpenDocument, RTF, CSV, ZIP, SVG) and extract text, metadata and links")
+    g.add_argument("--files-images", action="store_true", help="Also download images (JPEG, PNG, TIFF, HEIC, WebP) for EXIF/XMP: GPS, people, devices, software")
+    g.add_argument("--max-files", type=int, default=100, help="Max documents downloaded per target")
+    g.add_argument("--max-images", type=int, default=150, help="Max images downloaded per target")
+    g.add_argument("--max-file-bytes", type=int, default=30_000_000, help="Max size of one downloaded file")
+    g.add_argument("--files-any-host", action="store_true", help="Also download files hosted on other domains (CDNs, S3). Off by default: stay in scope")
+    g.add_argument("--exiftool", default="", help="Path to exiftool (default: from PATH). Versions older than 12.38 are refused")
+    g.add_argument("--no-exiftool", action="store_true", help="Don't use exiftool; built-in parsers only")
+    g.add_argument("--delete-files", action="store_true", help="Delete downloaded files after analysis (default: keep them in <out>/<target>/files/ as .quarantine)")
+
     g = p.add_argument_group("detection")
     g.add_argument("--entropy", action="store_true", help="Also report unnamed high-entropy string literals in JS (noisier, low confidence)")
     g.add_argument("--no-signature-api-keys", dest="signatures", action="store_false", help="Disable provider signature rules")
@@ -235,7 +246,11 @@ def main(argv=None):
         max_subdomains=max(0, args.max_subdomains),
         entropy=args.entropy, signatures=args.signatures, ignore_patterns=ignore, suppress_values=suppress,
         redact=args.redact, include_urls=args.include_urls, include_comments=args.include_comments,
+        files=args.files, files_images=args.files_images, max_files=max(0, args.max_files), max_images=max(0, args.max_images),
+        max_file_bytes=max(1000, args.max_file_bytes), files_any_host=args.files_any_host, files_root=out_dir,
     )
+    if args.files_images and not args.files:
+        opts.files = False  # images only
     return run(targets, opts, args, headers, out_dir)
 
 
@@ -335,6 +350,17 @@ def run(targets, opts, args, headers, out_dir):
         if spider is None:
             return
         reason = (crawler.stats.get_value("finish_reason") if crawler.stats else None) or "finished"
+        if spider.downloads:
+            from twisted.internet.threads import deferToThread
+
+            d = deferToThread(analyze_files, spider, args)
+            d.addCallback(lambda out: apply_file_results(spider, out))
+            d.addErrback(lambda f: print(f"\n[!] file analysis failed for {spider.target}: {f.getErrorMessage()}", file=sys.stderr))
+            d.addBoth(lambda _: write_done(spider, reason))
+            return d
+        write_done(spider, reason)
+
+    def write_done(spider, reason):
         res = target_result(spider, opts, reason)
         write_target(out_dir, res)
         state["results"].append(res)
@@ -348,6 +374,34 @@ def run(targets, opts, args, headers, out_dir):
             sys.stdout.write("\r\033[2K")
         print(line)
         sys.stdout.flush()
+
+    def analyze_files(spider, args):
+        from .files import FileAnalyzer
+
+        fa = FileAnalyzer(target_host=spider.scope.host, exiftool=False if args.no_exiftool else args.exiftool,
+                          detector_kwargs={"signatures": opts.signatures, "ignore_patterns": opts.ignore_patterns, "suppress_values": opts.suppress_values})
+        if not state.get("exif_noted"):
+            state["exif_noted"] = True
+            print(f"\n[files] {fa.exif_status}")
+        findings, records, inv = fa.analyze(spider.downloads)
+        return findings, records, inv, fa.exif_status
+
+    def apply_file_results(spider, out):
+        findings, records, inv, status = out
+        for rec in records:  # all URLs that served the same file
+            src = next((d for d in spider.downloads if d["path"] == rec["saved_as"]), None)
+            if src:
+                rec["urls"] = src["urls"]
+        spider.record(findings)  # reactor thread: safe for the stream writer
+        spider.file_records = records
+        spider.file_inventory = inv
+        spider.stats["files_exiftool"] = status
+        if args.delete_files:
+            for d in spider.downloads:
+                try:
+                    os.remove(d["path"])
+                except OSError:
+                    pass
 
     def crawl_one(target):
         if state["stopping"]:

@@ -9,6 +9,7 @@ It reports:
 - **Tokens and keys:** JWTs (decoded and classified, e.g. Supabase `service_role` vs `anon`, expired) and private keys (body validated).
 - **Disclosure:** internal IPs (including from response headers), target-domain and obfuscated emails, API endpoints, and exposed files and APIs (`--probe`).
 - **Lookalike domains:** a domain in site content that is one typo away from one the site normally uses, e.g. a contact email at `realifecover.com.au` on sites that use `reallifecover.com.au`. Mail or visitors sent to the typo go elsewhere.
+- **Downloaded files (`--files`, `--files-images`):** credentials and keys inside PDFs, Office/OpenDocument files, CSVs and ZIPs; account names, internal shares and hosts, people, GPS positions, devices and software versions from metadata. See [File analysis](#file-analysis---files).
 - **Mock code in production bundles:** test-only mock API code (MSW, Mirage, axios-mock-adapter) shipped to the browser is flagged once per file. The fake tokens and IDs inside it are downgraded, not reported as secrets.
 
 Public-by-design keys are reported as `info`, so they don't drown out real findings. Examples are Firebase/Maps browser keys, Stripe publishable keys, Supabase anon keys, Datadog RUM client tokens (`pub…`) and Sentry DSNs. Referenced cloud storage (S3, GCS, Azure Blob, Firebase) is listed as info for you to review.
@@ -20,6 +21,8 @@ python -m venv .venv
 . .venv/bin/activate  # Windows: .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
+
+ExifTool is optional but recommended for `--files-images` (`sudo apt install libimage-exiftool-perl`; Kali usually ships it). Without it, built-in parsers and Pillow (if installed) cover common EXIF, including GPS.
 
 ## Usage
 
@@ -55,6 +58,13 @@ Target lists accept full URLs or bare `host[:port]`, one per line, with `#` comm
 | `--include-subdomains` | off | Also crawl other subdomains of the target's domain that are linked or referenced in JS |
 | `--max-subdomains` | 15 | Cap on extra subdomains crawled per target |
 | `--probe` | off | ~90 GET checks with content validation and soft-404 detection: `.env` variants, `.git`/`.svn`/`.DS_Store`, config backups, OpenAPI/Swagger, GraphQL (incl. introspection), Spring actuator, WordPress user listing, ELMAH/trace, phpinfo, permissive crossdomain policies, and config-style API endpoints found in JS |
+| `--files` | off | Download linked documents (PDF, Office, OpenDocument, RTF, CSV, ZIP, SVG) and analyse them offline |
+| `--files-images` | off | Also download images (JPEG, PNG, TIFF, HEIC, WebP) for EXIF/XMP metadata |
+| `--max-files` / `--max-images` | 100 / 150 | Per-target download caps |
+| `--max-file-bytes` | 30 MB | Largest file downloaded |
+| `--files-any-host` | off | Also download files hosted on other domains (CDNs). Off keeps downloads in scope |
+| `--exiftool PATH` / `--no-exiftool` | PATH | ExifTool binary; versions before 12.38 are refused |
+| `--delete-files` | off | Delete downloaded files after analysis |
 | `--probe-sourcemaps` | off | Request `<script>.map` even when not referenced |
 | `--entropy` | off | Also report unnamed high-entropy JS strings (noisier) |
 | `--ignore REGEX` / `--ignore-file` | | Suppress known-benign values or URLs |
@@ -102,6 +112,73 @@ Each run writes to `-o DIR` (default `recon-<timestamp>/`):
   - `filtered_candidates`, which records why candidates were rejected (useful for tuning).
 
 > **Breaking change from v3:** results are now written to an output directory, with a flat findings list per target, instead of `results.json` and `findings.jsonl` in the working directory.
+
+## File analysis (`--files`)
+
+With `--files`, linked documents are downloaded and parsed offline after the crawl. They are found via links, sitemaps, JS and JSON references. `--files-images` adds images found in `<img>`, `srcset` and `og:image`. Findings appear next to the web findings, pointing at the file URL, and `report.md` gets a "From downloaded files" section.
+
+### What is extracted
+
+| Format | Text | Metadata and structure |
+|---|---|---|
+| PDF | All pages (pypdf), including glyph-per-character exports | Author, Creator/Producer, XMP, link annotations, attachments, JavaScript flag |
+| DOCX/XLSX/PPTX/VSDX (and macro variants) | Body, headers/footers, comments, tracked changes, speaker notes; spreadsheet rows as `Header: value` | Author, last modified by, company, template; external links (attached template, linked workbooks, hyperlinks); data connections (connection strings); comment/revision authors; hidden sheets; VBA macros |
+| ODT/ODS/ODP | Body and tables (header-aware) | Creator, generator, printer name, Basic macros |
+| DOC/XLS/PPT (legacy) | `.xls` rows via xlrd; `.doc`/`.ppt` text recovered as printable runs, with binary junk filtered out | ExifTool (author, company, template...), VBA flag |
+| RTF, CSV, TXT, SVG | Plain text; CSV as `Header: value` | RTF `\info`, Inkscape export paths, SVG creator |
+| ZIP | Text-like members (`.env`, configs, keys, scripts) and nested Office/PDF files, read in memory | Member list |
+| JPEG/PNG/TIFF/WebP/HEIC | PNG text chunks | GPS, people, devices and serials, host computer, software |
+
+Extracted text goes through the same detector as web content. It adds document-style credential patterns: `Password: Winter2026!`, "the admin password is …", `Password=` in connection strings, and table columns such as `Username | Password`.
+
+### What metadata is kept
+
+A survey of 395 real files in about 120 formats found that ExifTool returns about 44 values per file, nearly all of them noise: colour profiles, exposure settings, dimensions, and the downloaded copy's own local name, size and dates. Only these are kept:
+
+| Kept | Reported as |
+|---|---|
+| Usernames in paths (`C:\Users\jsmith\…`, `/home/x/`), UNC shares (`\\fs01\finance`), internal hostnames/IPs, `HostComputer` | `low` findings |
+| GPS position (photos) | `medium` finding with a map link |
+| Data connections (server), macros, PDF JavaScript | `low` findings |
+| People (author, last modified by, commenters, revision authors, photographer) | inventory |
+| Companies, software and versions, devices and serial numbers | inventory |
+| Titles, descriptions, comments, custom properties | scanned for secrets, not reported on their own |
+
+People are separated from tools (`cairo 1.16`, `LibreOffice 24.2` go to the software list) and placeholders are dropped (`Microsoft Office User`, `Administrator`, `Artist`, `unknown`…).
+
+### Safety model
+
+Downloaded files are hostile input. ReconSpider never executes or opens them with another application, and doesn't run LibreOffice or any viewer on them:
+
+- **What is downloaded:** only allow-listed document and image extensions are requested. `.exe` and scripts are never requested. Before anything is saved, the response is checked by magic bytes. Executables, scripts, unknown binaries and HTML (soft-404s and login pages served for a file URL) are discarded.
+- **How it is stored:** files go to `<out>/<target>/files/` under a hash-based name with a `.quarantine` suffix and `0600` permissions. Nothing from the server goes into the filename, and nothing opens on a double-click.
+- **How it is parsed:** in a separate Python process (`reconspider/extract.py`) with CPU (45 s), memory (2.5 GB), wall-clock (60 s) limits, a 0-byte file-size limit (it cannot write files) and an empty working directory. A parser hang or decompression bomb kills only that child.
+- **Parsers:** pure Python (stdlib, plus optional pypdf, xlrd and Pillow). XML with entity declarations is refused (XXE, "billion laughs"). Archives are read in memory with size and compression-ratio caps and never extracted, so `../../` member names are harmless.
+- **ExifTool:** run read-only. Versions before 12.38 are refused (CVE-2021-22204 code execution via malicious DjVu, CVE-2022-23935).
+
+### Results
+
+The planted corpus (`tests/file_corpus.py`) has 22 files. They include real LibreOffice conversions to PDF, ODT/ODS/ODP, DOC/XLS/PPT and RTF, decoy files and 7 hostile files:
+
+| | Result |
+|---|---|
+| Planted findings | 26/26 |
+| Decoy files / placeholder people | 0 findings / none |
+| Raw bytes scanned directly vs extraction | 4 findings in 3 files vs 79 in 20 files |
+| Hostile files (zip bomb, 1.2 GB PDF stream bomb, XXE, billion laughs, executable renamed `.pdf`, soft-404 `.pdf`, corrupt PDF) | all refused or parsed safely in 0.4 s; parent unaffected |
+| Sandbox: 6 GB allocation / CPU spin / infinite sleep / write attempt | killed / killed / killed / 0 bytes written |
+
+On 395 real-world files (ExifTool's multi-format samples plus system documents and images), metadata went from 12,327 values to 1,660 kept (13.5%). There were 7 findings at low or above, all true: 6 GPS positions and 1 Windows account name from a `.lnk` path. Raw binary scanning of the same files produced 1 junk value (an "IP" inside a binary), and only with `--entropy` enabled. Garbled binary is not where the false positives come from. Text hidden in compressed streams is what raw scanning misses.
+
+Limitations:
+- Scanned PDFs need OCR, which is not done.
+- Encrypted documents are flagged, not opened.
+- Legacy `.doc`/`.ppt` text recovery is heuristic.
+- Documents behind authentication need `-H`/`--cookie`.
+
+```bash
+python tests/file_corpus.py /tmp/corpus && python tests/file_eval.py /tmp/corpus --real /path/to/files
+```
 
 ## Accuracy
 

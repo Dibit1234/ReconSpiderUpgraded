@@ -68,6 +68,8 @@ def target_result(spider, opts, reason):
         "start_urls": [spider.target] + list(spider.extra_seeds),
         "endpoints": sorted(spider.endpoints),
         "js_files": sorted(spider.js_files),
+        "files": getattr(spider, "file_records", []),
+        "file_inventory": getattr(spider, "file_inventory", {}),
         "discovered_hosts": sorted(spider.discovered_hosts),
         "external_hosts": {h: sorted(k) for h, k in sorted(spider.external_refs.items())},
     }
@@ -173,6 +175,17 @@ def write_markdown(path, summary):
                 f"| {_md_escape(f['title'])} | `{_md_escape(f['value'][:90])}` | {f['confidence']} | {_md_escape(f['url'][:100])} | {_md_escape(tgt)} |"
             )
     inv = summary.get("inventory") or {}
+    docs = inv.get("documents") or {}
+    if docs:
+        lines += ["", f"## From downloaded files ({inv.get('files_analyzed', 0)} analyzed)", ""]
+        labels = (("usernames", "Account names (from file paths)"), ("internal_hosts", "Internal hosts and shares"), ("people", "People (authors, editors, commenters)"),
+                  ("companies", "Companies"), ("software", "Software and versions"), ("devices", "Devices"), ("flags", "File flags"))
+        for key, label in labels:
+            items = docs.get(key) or {}
+            if not items:
+                continue
+            shown = ", ".join(f"{_md_escape(v)} ({i['count']})" for v, i in list(items.items())[:40])
+            lines.append(f"- **{label}:** {shown}" + (f" … +{len(items) - 40} more" if len(items) > 40 else ""))
     if inv.get("subdomains"):
         lines += ["", f"## Discovered hosts on target domains ({len(inv['subdomains'])})", ""]
         lines += [f"- {h}" for h in inv["subdomains"][:300]]

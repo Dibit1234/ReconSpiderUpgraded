@@ -286,7 +286,8 @@ def _spider(target="https://acme.com/", **over):
 
     o = dict(include_subdomains=False, max_subdomains=15, entropy=False, signatures=True, ignore_patterns=[], suppress_values=[],
              max_assets=400, max_pages=300, max_depth=4, max_per_template=8, max_text_bytes=10**6, max_asset_bytes=10**6,
-             max_map_bytes=10**6, probe=False, seed=True, probe_sourcemaps=False, include_vendor=False)
+             max_map_bytes=10**6, probe=False, seed=True, probe_sourcemaps=False, include_vendor=False,
+             files=False, files_images=False, max_files=100, max_images=150, max_file_bytes=10**7, files_any_host=False, files_root="/nonexistent")
     o.update(over)
     return TargetSpider(target, SimpleNamespace(**o), sink=lambda s, f: None)
 

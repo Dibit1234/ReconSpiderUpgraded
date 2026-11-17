@@ -9,6 +9,7 @@ Run standalone:  python tests/fixture_site.py 8800
 import base64
 import binascii
 import json
+import os
 import random
 import string
 import sys
@@ -174,7 +175,7 @@ def layout(title, body, extra_head=""):
 </head><body>
 <header><nav><a href="/">Home</a> <a href="/about">About</a> <a href="/blog">Blog</a> <a href="/shop">Shop</a>
 <a href="/login">Login</a> <a href="/settings">Settings</a> <a href="/staff">Staff</a> <a href="/docs/a">Docs</a>
-<a href="/calendar/2026/11">Events</a> <a href="/logout">Log out</a> <a href="/contact">Contact</a> <a href="/next-app">App</a>
+<a href="/calendar/2026/11">Events</a> <a href="/logout">Log out</a> <a href="/contact">Contact</a> <a href="/next-app">App</a> <a href="/resources">Resources</a>
 <span class="card" data-target-url="/data-linked">Offers</span> <button onclick="location.href='/js-nav'">Quote</button>
 <a href="http://mailto:press@acme-corp.com">Press</a></nav>
 <img src="/static/img/logo@2x.png" alt="logo"></header>
@@ -334,6 +335,31 @@ STATIC = {
 }
 
 
+# Optional: serve a file corpus (tests/file_corpus.py output) under /downloads/
+FILE_CTYPES = {"pdf": "application/pdf", "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+               "docm": "application/vnd.ms-word.document.macroEnabled.12", "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+               "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation", "doc": "application/msword",
+               "xls": "application/vnd.ms-excel", "ppt": "application/vnd.ms-powerpoint", "odt": "application/vnd.oasis.opendocument.text",
+               "ods": "application/vnd.oasis.opendocument.spreadsheet", "odp": "application/vnd.oasis.opendocument.presentation",
+               "rtf": "application/rtf", "csv": "text/csv", "zip": "application/zip", "svg": "image/svg+xml", "jpg": "image/jpeg",
+               "png": "image/png", "tif": "image/tiff", "txt": "text/plain"}
+FILES = {}
+_corpus = os.environ.get("RS_FIXTURE_FILES")
+if _corpus and os.path.isdir(_corpus):
+    for _fn in sorted(os.listdir(_corpus)):
+        _p = os.path.join(_corpus, _fn)
+        if os.path.isfile(_p) and _fn != "truth.json":
+            FILES["/downloads/" + _fn] = (FILE_CTYPES.get(_fn.rsplit(".", 1)[-1], "application/octet-stream"), open(_p, "rb").read())
+    _h = os.path.join(_corpus, "hostile")
+    for _fn in ("invoice.pdf", "soft404.pdf", "corrupt.pdf", "xxe.docx"):
+        if os.path.exists(os.path.join(_h, _fn)):
+            FILES["/downloads/hostile-" + _fn] = (FILE_CTYPES.get(_fn.rsplit(".", 1)[-1]), open(os.path.join(_h, _fn), "rb").read())
+    FILES["/downloads/setup.exe"] = ("application/octet-stream", b"MZ" + b"\x00" * 500)
+RESOURCES = layout("Resources", "".join(
+    f'<img src="{u}" alt="">' if u.endswith((".jpg", ".png", ".tif")) else f'<a href="{u}">{u.rsplit("/", 1)[-1]}</a><br>' for u in FILES
+) + '<script>var brochure = "/downloads/report.pdf";</script>')
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     count = 0
@@ -377,6 +403,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, "text/html", calendar(int(parts[1]), int(parts[2])))
             except (IndexError, ValueError):
                 pass
+        if path == "/resources":
+            return self._send(200, "text/html", RESOURCES)
+        if path in FILES:
+            ctype, data = FILES[path]
+            return self._send(200, ctype, data)
         if path == "/sitemap_index.xml":
             return self._send(200, "application/xml", f'<?xml version="1.0"?><sitemapindex><sitemap><loc>http://{host}/sitemap-posts.xml</loc></sitemap></sitemapindex>')
         if path == "/sitemap-posts.xml":

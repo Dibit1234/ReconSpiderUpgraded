@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import os
 import random
 import re
 import string
@@ -11,6 +12,12 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 import scrapy
 
 from .detect import Detector, is_vendor, registrable_domain
+
+
+def slug_for(target):
+    from .output import slug
+
+    return slug(target)
 
 # --------------------------------------------------------------------------- #
 # URL helpers
@@ -23,6 +30,17 @@ TRACKING_PARAMS = {
     "replytocom", "phpsessid", "sessionid", "jsessionid", "sid", "_", "cb", "nocache",
 }
 CACHE_BUSTERS = {"v", "ver", "version", "t", "ts", "_v", "hash", "rev", "build"}
+
+# --files: what may be downloaded for analysis. Executables/scripts are never
+# fetched; content is re-checked by magic bytes before anything is saved.
+DOC_EXT = (".pdf", ".doc", ".docx", ".docm", ".dot", ".dotx", ".dotm", ".xls", ".xlsx", ".xlsm", ".ppt", ".pptx", ".pptm",
+           ".pps", ".ppsx", ".odt", ".ods", ".odp", ".odg", ".rtf", ".csv", ".vsdx", ".zip", ".svg")
+IMAGE_EXT = (".jpg", ".jpeg", ".tif", ".tiff", ".png", ".heic", ".heif", ".webp")
+FILE_PATH_RE = re.compile(r"""["'`]((?:https?:)?(?://[A-Za-z0-9.-]+)?/[A-Za-z0-9_./%~+-]{1,300}\.(?:pdf|docx?|docm|xlsx?|xlsm|pptx?|pptm|odt|ods|odp|rtf|csv|zip))(?:\?[^"'`\s<>]{0,100})?["'`]""", re.I)
+SAVE_MAGIC = (  # parent-side gate: (prefix, offset, extension)
+    (b"%PDF", 0, "pdf"), (b"PK\x03\x04", 0, "zip"), (b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1", 0, "ole"), (b"{\\rtf", 0, "rtf"),
+    (b"\xff\xd8\xff", 0, "jpg"), (b"\x89PNG", 0, "png"), (b"II*\x00", 0, "tif"), (b"MM\x00*", 0, "tif"), (b"WEBP", 8, "webp"), (b"ftyp", 4, "heif"),
+)
 
 SKIP_EXT = (
     ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg", ".ico", ".avif", ".tif", ".tiff",
@@ -270,6 +288,11 @@ class TargetSpider(scrapy.Spider):
         self.seeded_hosts = set()
         self.next_build_ids = set()
         self.config_probes = 0
+        self.downloads = []  # [{"url", "path", "bytes", "sha1", "kind", "urls"}]
+        self.download_by_sha = {}
+        self.file_counts = {"doc": 0, "image": 0}
+        self.file_records = []
+        self.file_inventory = {}
         self.start_ok = False
         self.start_error = None
         self.o = opts
@@ -311,6 +334,7 @@ class TargetSpider(scrapy.Spider):
             "pages_scheduled": 0, "pages_fetched": 0, "assets_scheduled": 0, "assets_fetched": 0,
             "sourcemaps_fetched": 0, "duplicate_bodies": 0, "lines_skipped_dedupe": 0,
             "skipped_template_cap": 0, "skipped_trap": 0, "skipped_unsafe": 0, "skipped_budget": 0,
+            "files_saved": 0, "files_duplicate": 0, "files_rejected_html": 0, "files_rejected_type": 0, "files_bytes": 0,
             "skipped_out_of_scope": 0, "bytes_scanned": 0, "scan_seconds": 0.0, "probes_hit": 0,
             "sitemap_urls": 0, "robots_paths": 0, "errors": 0,
         }
@@ -411,6 +435,11 @@ class TargetSpider(scrapy.Spider):
             return None
         url = url.split("#", 1)[0]
         p = urlparse(url)
+        fpath = p.path.lower()
+        if self.o.files and fpath.endswith(DOC_EXT):
+            return self.file_request(url, "doc")
+        if self.o.files_images and fpath.endswith(IMAGE_EXT):
+            return self.file_request(url, "image")
         if not self.scope.page_ok(p.hostname, p.port, p.scheme):
             self.stats["skipped_out_of_scope"] += 1
             return None
@@ -547,6 +576,7 @@ class TargetSpider(scrapy.Spider):
             forms = sel.css("form::attr(action)").getall()
             link_rel = sel.xpath("//link[@href]")
             scripts = sel.css("script::attr(src)").getall()
+            images = sel.css("img::attr(src), img::attr(data-src), img::attr(srcset), source::attr(srcset), meta[property='og:image']::attr(content)").getall() if self.o.files_images else []
             self.form_fields.update(x for x in sel.css("input::attr(name), textarea::attr(name), select::attr(name)").getall() if len(self.form_fields) < 5000)
         except (ValueError, AttributeError):
             return
@@ -566,6 +596,19 @@ class TargetSpider(scrapy.Spider):
                     r = self.asset_request(f"{origin}/_next/static/{bid}/{name}", "js", callback=self.parse_build_manifest, priority=70)
                     if r:
                         yield r
+
+        for img in images:
+            for part in img.split(","):  # srcset: "a.jpg 1x, b.jpg 2x"
+                u = part.strip().split(" ", 1)[0]
+                if u and not u.startswith("data:"):
+                    r = self.file_request(response.urljoin(u), "image")
+                    if r:
+                        yield r
+        if self.o.files:
+            for m in FILE_PATH_RE.finditer(text):
+                r = self.file_request(response.urljoin(m.group(1)), "doc")
+                if r:
+                    yield r
 
         for src in scripts:
             url = response.urljoin(src.strip())
@@ -718,6 +761,12 @@ class TargetSpider(scrapy.Spider):
                 r = self.asset_request(url, "json", priority=35)
                 if r:
                     self.config_probes += 1
+                    out.append(r)
+        if self.o.files:
+            for m in FILE_PATH_RE.finditer(text):
+                p = m.group(1)
+                r = self.file_request(urljoin(origin + "/", p) if p.startswith("/") and not p.startswith("//") else urljoin(base_url, p), "doc")
+                if r:
                     out.append(r)
         # Absolute URLs: inventory every host; same-site pages get crawled
         if "://" in text:
@@ -1030,6 +1079,81 @@ class TargetSpider(scrapy.Spider):
         }])
 
     # ---------------------------------------------------------------- status
+    # ---------------------------------------------------------------- files
+    def file_request(self, url, cls):
+        """Schedule a document/image download for offline analysis."""
+        url = url.split("#", 1)[0]
+        p = urlparse(url)
+        if p.scheme not in {"http", "https"}:
+            return None
+        if not (self.scope.asset_ok(p.hostname) or self.o.files_any_host):
+            self.stats["skipped_out_of_scope"] += 1
+            return None
+        key = asset_key(url)
+        if key in self.seen_assets:
+            return None
+        cap = self.o.max_files if cls == "doc" else self.o.max_images
+        if self.file_counts[cls] >= cap:
+            self.stats["skipped_budget"] += 1
+            return None
+        self.seen_assets.add(key)
+        self.file_counts[cls] += 1
+        return scrapy.Request(
+            url, callback=self.parse_file, errback=self.on_error, priority=10 if cls == "doc" else -25, cb_kwargs={"cls": cls},
+            meta={"download_maxsize": self.o.max_file_bytes, "depth": 0, "allow_offsite": self.o.files_any_host},
+        )
+
+    def parse_file(self, response, cls="doc"):
+        body = response.body
+        if response.status != 200 or len(body) < 16:
+            return
+        head = body[:512].lstrip().lower()
+        if head.startswith((b"<!doctype", b"<html", b"<head", b"<body", b"<?php")) or b"<html" in head[:200]:
+            self.stats["files_rejected_html"] += 1  # soft 404 / login page served for the file URL
+            return
+        ext = next((e for magic, off, e in SAVE_MAGIC if body[off:off + len(magic)] == magic), None)
+        path_l = urlparse(response.url).path.lower()
+        if ext is None:
+            if path_l.endswith((".csv", ".svg")) and b"\x00" not in body[:4096]:
+                ext = path_l.rsplit(".", 1)[-1]
+            else:
+                self.stats["files_rejected_type"] += 1  # executables, scripts, unknown binaries: never saved
+                return
+        # Keep the URL's extension when it agrees with the content (PK -> docx/xlsx/...,
+        # OLE -> doc/xls/ppt) so the saved copy is easy to review; the name is
+        # still hash-based.
+        url_ext = path_l.rsplit(".", 1)[-1] if "." in path_l.rsplit("/", 1)[-1] else ""
+        family = {"zip": {"docx", "docm", "dotx", "dotm", "xlsx", "xlsm", "pptx", "pptm", "ppsx", "odt", "ods", "odp", "odg", "vsdx", "zip"},
+                  "ole": {"doc", "dot", "xls", "ppt", "pps"}, "jpg": {"jpg", "jpeg"}, "tif": {"tif", "tiff"}, "heif": {"heic", "heif"}}
+        if url_ext in family.get(ext, ()):
+            ext = url_ext
+        digest = hashlib.sha1(body).hexdigest()
+        prev = self.download_by_sha.get(digest)
+        if prev:
+            self.stats["files_duplicate"] += 1
+            if response.url not in prev["urls"] and len(prev["urls"]) < 10:
+                prev["urls"].append(response.url)
+            return
+        d = os.path.join(self.o.files_root, slug_for(self.target), "files")
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        # Hash-based name and a .quarantine suffix: nothing from the server
+        # ends up in the filename, and nothing opens on a double-click.
+        path = os.path.join(d, f"{digest[:20]}.{ext}.quarantine")
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        except FileExistsError:
+            fd = None
+        if fd is not None:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(body)
+        rec = {"url": response.url, "path": path, "bytes": len(body), "sha1": digest, "cls": cls, "urls": [response.url],
+               "content_type": response.headers.get("Content-Type", b"").decode("latin-1")[:100]}
+        self.download_by_sha[digest] = rec
+        self.downloads.append(rec)
+        self.stats["files_saved"] += 1
+        self.stats["files_bytes"] += len(body)
+        self.scan_headers(response)
+
     def status(self):
         return {
             "target": self.target,

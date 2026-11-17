@@ -349,6 +349,13 @@ KEY_ANCHOR_RE_I = re.compile(r"(?i)pass|pwd|secret|token|key|auth|cred|user|logi
 ALL_KEYWORDS = sorted({k for r in RULES for k in r.keywords})
 KEY_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_$-")
 POST_KEY_RE = re.compile(r"[\"']?[ \t]{0,3}(===?|:=|=>|=|:)[ \t]{0,3}([\"'`])")
+DOC_KV_RE = re.compile(
+    r"(?im)^[ \t\-*•]*(?P<key>[A-Za-z][A-Za-z0-9_.-]*(?:[ \t][A-Za-z0-9_.-]+){0,3})[ \t]*(?::|=|\|)[ \t]*[\"'“]?(?P<val>[^\s\"'”]{3,128})[\"'”]?[ \t]*$"
+)
+DOC_INLINE_RE = re.compile(
+    r"(?i)\b(?P<key>(?:(?:admin|root|db|database|wifi|wi-fi|vpn|portal|default|temp(?:orary)?|service|account|login)\s+)?(?:password|passwd|passcode|pwd|pin|username|user\s?name|login|api\s?key|secret))"
+    r"\s+(?:is|was|=|:)\s+[\"'“]?(?P<val>[^\s\"'”,;]{4,128})"
+)
 ENV_LINE_RE = re.compile(
     r"(?m)^[ \t]*(?:export[ \t]+)?(?P<key>[A-Za-z_][A-Za-z0-9_.-]{1,64})[ \t]*[=:][ \t]*(?P<q>[\"']?)(?P<val>[^\r\n#\"']{1,512}?)(?P=q)[ \t]*(?:#.*)?$"
 )
@@ -613,8 +620,10 @@ class Detector:
             self._scan_rules(text, url, source, findings, lower=lower)
         self._scan_url_creds(text, url, source, findings)
         self._scan_generic(text, url, source, findings, vendor, lower=lower)
-        if source in {"probe", "config", "sourcemap"} or re.search(r"(?i)\.(?:env|ini|cfg|conf|properties|ya?ml|toml|txt)(?:$|\?)", url or ""):
+        if source in {"probe", "config", "sourcemap", "document"} or re.search(r"(?i)\.(?:env|ini|cfg|conf|properties|ya?ml|toml|txt)(?:$|\?)", url or ""):
             self._scan_env_lines(text, url, source, findings)
+        if source == "document":
+            self._scan_doc_lines(text, url, source, findings)
         if source in {"html", "probe"} and "<input" in lower and "password" in lower:
             self._scan_password_inputs(text, url, source, findings)
         if self.ips and not vendor:
@@ -782,6 +791,16 @@ class Detector:
     def _scan_env_lines(self, text, url, source, findings):
         for m in ENV_LINE_RE.finditer(text):
             self._emit_kv(m.group("key"), m.group("val"), "=", text, m.start(), m.end(), url, source, findings, False, strong_source=True)
+
+    def _scan_doc_lines(self, text, url, source, findings):
+        """Prose and tables: "Admin password: Winter2026!", "the PIN is 4417",
+        "Username | svc_backup" (xlsx/csv rows arrive as "Header: value")."""
+        for m in DOC_KV_RE.finditer(text):
+            key = re.sub(r"\s+", "_", m.group("key").strip())
+            self._emit_kv(key, m.group("val"), ":", text, m.start(), m.end(), url, source, findings, False, strong_source=True)
+        for m in DOC_INLINE_RE.finditer(text):
+            key = re.sub(r"\s+", "_", m.group("key").strip())
+            self._emit_kv(key, m.group("val").rstrip(".)"), "is", text, m.start(), m.end(), url, source, findings, False)
 
     def _scan_password_inputs(self, text, url, source, findings):
         for tag in INPUT_TAG_RE.findall(text):

@@ -172,6 +172,20 @@ def v_basic_auth(value, ctx):
     return {"extra": {"decoded": decoded}, "reasons": ["basic_auth_decoded"]}
 
 
+_CONN_CTX = re.compile(r"(?i)data source\s*=|server\s*=|initial catalog\s*=|provider\s*=|user id\s*=|uid\s*=|database\s*=|host\s*=|dsn\s*=")
+_CONN_PLACEHOLDER = re.compile(r"(?i)^(?:\*+|x+|\{.*\}|\$\(.*\)|\[.*\]|<.*>|%.*%|password|pass|pwd|your.*|changeme|secret|null|none)$")
+
+
+def v_connection_string(value, ctx):
+    m = ctx["match"]
+    text = ctx["text"]
+    window = text[max(0, m.start() - 300) : m.end() + 300]
+    v = value.strip()
+    if not _CONN_CTX.search(window) or _CONN_PLACEHOLDER.match(v) or len(v) < 3:
+        return None
+    return {"reasons": ["connection_string_context"]}
+
+
 def v_aws_key_id(value, ctx):
     # AKIA... keys are base32 (A-Z, 2-7) after the 4-char prefix.
     if not re.fullmatch(r"[A-Z2-7]{16}", value[4:]):
@@ -683,6 +697,15 @@ RULES = [
         severity="medium",
         category="token",
         validator=v_jwt,
+    ),
+    Rule(
+        "connection_string_password",
+        "Password in connection string",
+        R(r"(?i)(?:^|[;\"'\s])(?:password|pwd)\s*=\s*(?P<v>[^;\"'\r\n<>]{3,128})"),
+        ("password", "pwd"),
+        severity="critical",
+        category="credential",
+        validator=v_connection_string,
     ),
     Rule(
         "basic_auth_header",
